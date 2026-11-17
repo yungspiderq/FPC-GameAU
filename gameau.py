@@ -15,14 +15,14 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import requests
 
 NAME = "GameAU"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DESCRIPTION = "Автовыдача GameAU: Steam, Telegram, игры, ключи и карты. /gameau"
 CREDITS = "https://github.com/yungspiderq"
 UUID = "7dbcd7e7-2193-43db-a5bb-072eab977041"
@@ -40,6 +40,10 @@ NAMES = {"steamLogin": "Логин Steam (не ник)", "invite_url": "Ссыл
 DEFAULT = {"enabled": False, "dry_run": True, "api_key": "", "live_confirmed": False,
            "min_balance": "0", "lots": {}, "account_id": None,
            "guard_enabled": False, "guard_threshold": "0"}
+PRICE_DEFAULT = {"enabled": False, "source": "funpay", "margin": "10", "withdraw_usdt": "100",
+                 "usdt_per_usd": "1", "extra_percent": "0", "manual_rates": {}, "manual_lots": []}
+PRICE_INTERVAL = 15 * 60
+LOT_CURRENCIES = {"RUB", "USD", "EUR"}
 SUCCESS_STATES = {"success", "completed", "complete", "delivered"}
 FAIL_STATES = {"failed", "refunded", "cancelled", "canceled", "rejected"}
 REMOTE_STATES = SUCCESS_STATES | FAIL_STATES | {"processing"}
@@ -85,6 +89,31 @@ def usd(value):
     if n > 1000000 or n.as_tuple().exponent < -4:
         raise PluginError("Сумма USD: не больше 1000000 и не больше 4 знаков после точки.")
     return n
+
+
+def price_settings(saved):
+    if not isinstance(saved, dict):
+        raise PluginError("Неверные настройки автоцен.")
+    cfg = copy.deepcopy(PRICE_DEFAULT)
+    cfg.update(saved)
+    if type(cfg["enabled"]) is not bool or cfg["source"] not in {"funpay", "manual"}:
+        raise PluginError("Неверный режим автоцен или источник курса.")
+    for field in ("margin", "extra_percent"):
+        if number(cfg[field], zero=True) >= 100:
+            raise PluginError("Процент должен быть от 0 до 99,99.")
+    for field in ("withdraw_usdt", "usdt_per_usd"):
+        if number(cfg[field]) > 100000:
+            raise PluginError("Сумма или курс слишком велики.")
+    rates = cfg["manual_rates"]
+    if not isinstance(rates, dict) or set(rates) - LOT_CURRENCIES:
+        raise PluginError("Ручные курсы задаются в RUB, USD или EUR за 1 USDT.")
+    for rate in rates.values():
+        if number(rate) > 1000000:
+            raise PluginError("Ручной курс слишком велик.")
+    if not isinstance(cfg["manual_lots"], list) or any(
+            not isinstance(lid, str) or not lid.isdigit() for lid in cfg["manual_lots"]):
+        raise PluginError("Неверный список лотов с ручной ценой.")
+    return cfg
 
 
 def validate_rule(rule):
@@ -204,6 +233,7 @@ class Config:
             if not isinstance(saved, dict):
                 raise PluginError("Повреждён config.json.")
             data.update(saved)
+        data["pricing"] = price_settings(data.get("pricing", {}))
         self.save(data)
 
     def snapshot(self):
@@ -211,6 +241,7 @@ class Config:
             return copy.deepcopy(self.data)
 
     def save(self, data):
+        price_settings(data.get("pricing", {}))
         for key in ("enabled", "dry_run", "live_confirmed", "guard_enabled"):
             if type(data.get(key)) is not bool:
                 raise PluginError("Неверные переключатели в настройках.")
@@ -491,6 +522,183 @@ class BalanceGuard:
         return restored, errors
 
 
+class Pricing:
+    def __init__(self, engine):
+        self.e = engine
+        self.rates = {}
+        self.checked = {}
+        self.status = {}
+        self.next_run = 0
+
+    def lot_fields(self, lid):
+        self.e.bind_account()
+        fields = self.e.c.account.get_lot_fields(int(lid))
+        if str(fields.lot_id) != lid or fields.currency.name not in LOT_CURRENCIES:
+            raise PluginError("Не удалось определить лот или валюту FunPay.")
+        return fields
+
+    def rate(self, currency, cfg):
+        if cfg["source"] == "manual":
+            if currency.name not in cfg["manual_rates"]:
+                raise PluginError(f"Задайте ручной курс USDT для {currency.name}.")
+            return number(cfg["manual_rates"][currency.name]), None
+        usdt = number(cfg["withdraw_usdt"])
+        key = currency.name, usdt
+        cached = self.rates.get(key)
+        if cached and time.monotonic() - cached[0] < 120:
+            return cached[1]
+        account = self.e.c.account
+        try:
+            response = account.method(
+                "post", "withdraw/calc", {"x-requested-with": "XMLHttpRequest", "accept": "application/json"},
+                {"csrf_token": account.csrf_token, "preview": "1", "currency_id": currency.code,
+                 "ext_currency_id": "usdt_trc", "wallet": "", "amount_ext": format(usdt, "f")},
+                raise_not_200=True,
+            ).json()
+            if not isinstance(response, dict) or response.get("error"):
+                raise ValueError
+            amount = response.get("amount_int")
+            if isinstance(amount, str):
+                amount = re.sub(r"[ \u00a0\u202f]", "", amount).replace(",", ".")
+            debit = number(amount)
+        except Exception:
+            raise PluginError(
+                "FunPay не вернул расчёт вывода USDT TRC20. Проверьте доступность способа вывода "
+                "и сумму расчёта либо выберите ручной курс."
+            ) from None
+        result = debit / usdt, (debit, usdt)
+        self.rates[key] = time.monotonic(), result
+        return result
+
+    def cost(self, rule):
+        kind = rule["kind"]
+        if kind in {"steamTopup", "steamGifts"}:
+            p = rule["params"]
+            keys = ("amount", "currency") if kind == "steamTopup" else ("app_id", "sub_id", "region")
+            data = self.e.api.call("/" + kind + "/quote", {key: p[key] for key in keys}).get("quote")
+            if not isinstance(data, dict) or data.get("charge_currency", "USD") != "USD":
+                raise PluginError("Неверная цена в расчёте GameAU.")
+            price = usd(data.get("charge"))
+        else:
+            price = self.e.catalog_cost(rule, 1)
+        if price > usd(rule["max_cost"]):
+            raise PluginError("Закупка за одну штуку превысила лимит GameAU для заказа. Проверьте привязку.")
+        return price
+
+    def calculate(self, lid, fields=None):
+        fields = fields or self.lot_fields(lid)
+        config = self.e.config.snapshot()
+        rule = config["lots"].get(lid)
+        if not rule:
+            raise PluginError("Сначала привяжите лот к товару GameAU.")
+        cfg = config["pricing"]
+        price_usd = self.cost(rule)
+        rate, withdrawal = self.rate(fields.currency, cfg)
+        needed_usdt = price_usd * number(cfg["usdt_per_usd"])
+        cost = needed_usdt * rate
+        fee = number(cfg["extra_percent"], zero=True) / 100
+        margin = number(cfg["margin"], zero=True) / 100
+        target = (cost / ((1 - fee) * (1 - margin))).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+        if target >= 10**8:
+            raise PluginError("Расчётная цена выходит за допустимый диапазон.")
+        net = target * (1 - fee)
+        current = number(fields.price)
+        old_net = current * (1 - fee)
+        return {"lot": lid, "currency": fields.currency, "current": current, "target": target, "cost": cost,
+                "price_usd": price_usd, "rate": rate, "usdt": needed_usdt, "withdrawal": withdrawal,
+                "fee": target - net, "net": net, "profit": net - cost, "margin": (net - cost) / net * 100,
+                "old_margin": (old_net - cost) / old_net * 100, "desired": cfg["margin"],
+                "old_methods": getattr(getattr(fields, "calc_result", None), "methods", []),
+                "methods": self.buyer_prices(fields, target), "time": time.monotonic(),
+                "settings": cfg, "rule": rule, "key": fingerprint(self.e.api.key())}
+
+    def manual_preview(self, lid, price):
+        fields = self.lot_fields(lid)
+        if price >= 10**8 or price.as_tuple().exponent < -2:
+            raise PluginError("Укажите цену меньше 100000000, до двух знаков после точки.")
+        return {"lot": lid, "currency": fields.currency, "current": number(fields.price),
+                "target": price, "methods": self.buyer_prices(fields, price), "time": time.monotonic()}
+
+    def buyer_prices(self, fields, target):
+        category = fields.subcategory
+        try:
+            result = self.e.c.account.calc(category.type, subcategory_id=category.id, price=float(target))
+        except Exception:
+            raise PluginError("FunPay не рассчитал цену для покупателя в этой категории.") from None
+        if result.account_currency != fields.currency or not result.methods:
+            raise PluginError("FunPay не подтвердил валюту или способы оплаты.")
+        return result.methods
+
+    def can_write(self, auto):
+        cfg = self.e.config.snapshot()
+        plugin = self.e.c.plugins.get(UUID)
+        if self.e.stopped or not (plugin and plugin.enabled) or cfg["dry_run"]:
+            raise PluginError("Для сохранения цены включите плагин Cardinal и реальный режим GameAU.")
+        if auto and (not self.e.active() or not cfg["pricing"]["enabled"]):
+            raise PluginError("Автообновление цен приостановлено.")
+        return cfg
+
+    def apply(self, preview, auto=False, manual=False):
+        lid = preview["lot"]
+        if time.monotonic() - preview["time"] > 120:
+            raise PluginError("Расчёт устарел. Откройте его заново.")
+        self.can_write(auto)
+        with self.e.guard.gate:
+            fields = self.lot_fields(lid)
+            cfg = self.can_write(auto)
+            if lid not in cfg["lots"] or fields.currency != preview["currency"]:
+                raise PluginError("Лот или его валюта изменились. Пересчитайте цену.")
+            if not manual and (cfg["pricing"] != preview["settings"] or cfg["lots"][lid] != preview["rule"]
+                               or fingerprint(self.e.api.key()) != preview["key"]):
+                raise PluginError("Настройки расчёта изменились. Откройте расчёт заново.")
+            if auto and (not fields.active or fields.auto_delivery or lid in cfg["pricing"]["manual_lots"]
+                         or not cfg["lots"][lid].get("enabled", True)):
+                return False
+            if number(fields.price) != preview["current"]:
+                raise PluginError("Цена лота изменилась. Откройте новый расчёт.")
+            if manual and lid not in cfg["pricing"]["manual_lots"]:
+                cfg["pricing"]["manual_lots"].append(lid)
+                self.e.config.save(cfg)
+            if preview["target"] == preview["current"]:
+                return False
+            fields.price = float(preview["target"])
+            try:
+                self.e.c.account.save_lot(fields)
+                saved = self.lot_fields(lid)
+            except Exception:
+                raise PluginError("FunPay не подтвердил сохранение. Проверьте текущую цену лота.") from None
+            if saved.currency != preview["currency"] or number(saved.price) != preview["target"]:
+                raise PluginError("Сохранённая цена отличается от расчёта. Проверьте лот на FunPay.")
+            return True
+
+    def tick(self):
+        cfg = self.e.config.snapshot()
+        pricing = cfg["pricing"]
+        now = time.monotonic()
+        if not pricing["enabled"] or cfg["dry_run"] or now < self.next_run:
+            return
+        candidates = [lid for lid, rule in cfg["lots"].items() if rule.get("enabled", True)
+                      and lid not in pricing["manual_lots"] and now >= self.checked.get(lid, 0)]
+        if not candidates:
+            return
+        lid = min(candidates, key=lambda lot_id: self.checked.get(lot_id, 0))
+        self.checked[lid] = now + PRICE_INTERVAL
+        self.next_run = now + 5
+        try:
+            fields = self.lot_fields(lid)
+            if not fields.active or fields.auto_delivery:
+                return
+            preview = self.calculate(lid, fields)
+            changed = self.apply(preview, auto=True)
+            self.status[lid] = (time.time(), f"{preview['target']:.2f} {fields.currency.name}"
+                                + (" · обновлено" if changed else " · без изменений"))
+        except Exception as exc:
+            error = str(exc) if isinstance(exc, PluginError) else "Не удалось получить данные для расчёта."
+            if self.status.get(lid, (0, ""))[1] != error:
+                self.e.notify(f"Автоцены GameAU, лот #{lid}. {error}")
+            self.status[lid] = time.time(), error
+
+
 class Engine:
     def __init__(self, cardinal, root=ROOT, api=None):
         self.c = cardinal
@@ -513,6 +721,7 @@ class Engine:
         self.lot_cache = {}
         self.panel = Panel(self)
         self.guard = BalanceGuard(self)
+        self.pricing = Pricing(self)
 
     def active(self):
         plugin = self.c.plugins.get(UUID)
@@ -738,19 +947,7 @@ class Engine:
             if offered != payload or total != quote_limit:
                 raise PluginError("Расчёт изменил товар, получателя или сумму. Покупка остановлена.")
         else:
-            item = self.current_item(rule)
-            fresh = catalog_rule(item)
-            if (fresh["params"] != rule["params"] or fresh["quantity"] != rule.get("quantity", 1)
-                    or [f["path"] for f in fresh["inputs"]] != [f["path"] for f in rule["inputs"]]):
-                raise PluginError("Шаблон товара или поля получателя изменились. Проверьте привязку.")
-            count = payload.get("quantity", 1) if kind in {"gamekeys", "giftcards", "telegramStars"} else 1
-            if count < integer(item.get("min_quantity"), 10000) or count > integer(item.get("max_quantity"), 10000):
-                raise PluginError("Количество не соответствует текущим условиям GameAU.")
-            stock = item.get("stock")
-            if stock is not None and (type(stock) is not int or stock < count):
-                raise PluginError("Недостаточно товара у GameAU.")
-            # The catalog price belongs to the selected order template, not an arbitrary SKU guess.
-            total = number(item.get("price")) * row["units"]
+            total = self.catalog_cost(rule, row["units"])
         maximum = usd(rule["max_cost"])
         if total > maximum:
             raise PluginError("Стоимость заказа выше установленного лимита USD.")
@@ -764,6 +961,23 @@ class Engine:
         ceiling = ceiling.quantize(Decimal("0.0001"), rounding="ROUND_DOWN")
         payload["maxCharge"] = float(usd(ceiling))
         return payload, total
+
+    def catalog_cost(self, rule, units):
+        item = self.current_item(rule)
+        fresh = catalog_rule(item)
+        if (fresh["params"] != rule["params"] or fresh["quantity"] != rule.get("quantity", 1)
+                or [f["path"] for f in fresh["inputs"]] != [f["path"] for f in rule["inputs"]]):
+            raise PluginError("Шаблон товара или поля получателя изменились. Проверьте привязку.")
+        kind = rule["kind"]
+        count = rule.get("quantity", 1) * units if kind in {"gamekeys", "giftcards"} else 1
+        if kind == "telegramStars":
+            count = rule["params"]["quantity"]
+        if count < integer(item.get("min_quantity"), 10000) or count > integer(item.get("max_quantity"), 10000):
+            raise PluginError("Количество не соответствует текущим условиям GameAU.")
+        stock = item.get("stock")
+        if stock is not None and (type(stock) is not int or stock < count):
+            raise PluginError("Недостаточно товара у GameAU.")
+        return number(item.get("price")) * units
 
     def process(self, row):
         if row["state"] != "ready" or not self.active():
@@ -917,6 +1131,7 @@ class Engine:
         candidates = [r for r in self.ledger.rows() if r["state"] in ACTIVE_STATES
                       and time.time() - r.get("last_poll", 0) >= (60 if r.get("slow_notice") else 10)]
         if not candidates:
+            self.pricing.tick()
             return
         row = min(candidates, key=lambda r: r.get("last_poll", 0))
         try:
@@ -1033,6 +1248,7 @@ class Panel:
         self.pending = {}
         self.drafts = {}
         self.choices = {}
+        self.price_previews = {}
 
     @staticmethod
     def context(message, user=None, edit=False):
@@ -1082,6 +1298,7 @@ class Panel:
                    [("📦 Мои лоты", "lots:0"), ("🛍 Каталог API", "catalog")],
                    [("🧾 Заказы", "orders:0"), ("🛡 Минимальный остаток", "reserve")],
                    [("📉 Отключение лотов по балансу", "guard")],
+                   [("💸 Цены и комиссии", "pricing")],
                    [("❓ Как настроить", "help"), ("🔄 Обновить меню", "home")],
                    [("◀️ К плагину", f"={CBT.EDIT_PLUGIN}:{UUID}:0")]])
 
@@ -1124,6 +1341,7 @@ class Panel:
             text += "Не настроен."
         rows = [[("⚙️ Настроить по шагам", f"setup:{lid}")], [("📝 Настроить JSON", f"json:{lid}")]]
         if r:
+            rows.append([("💸 Цена и комиссии", f"price:{lid}")])
             rows += [[("✅ / ⛔ Переключить", f"switch:{lid}")], [("🗑 Убрать привязку", f"unbind:{lid}")]]
         self.show(ctx, text, rows + [[("◀️ Лоты", "lots:0")]])
 
@@ -1201,6 +1419,108 @@ class Panel:
                   "Проверьте регион товара. Сохранение не выполняет покупку.",
                   [[("💾 Сохранить", "save")], [("❌ Отмена", "home")]])
 
+    def pricing_menu(self, ctx):
+        cfg = self.e.config.snapshot()
+        p = cfg["pricing"]
+        source = "предварительный расчёт вывода FunPay USDT TRC20" if p["source"] == "funpay" else "ручной курс"
+        rates = ", ".join(f"{v} {k}" for k, v in sorted(p["manual_rates"].items())) or "не заданы"
+        state = "выключены"
+        if p["enabled"]:
+            state = "включены" if self.e.active() and not cfg["dry_run"] else "на паузе"
+        self.show(ctx, f"💸 Автоцены {state}\n"
+                  f"Источник курса: {source}\nРучные курсы за 1 USDT: {rates}\n"
+                  f"Сумма для расчёта вывода: {p['withdraw_usdt']} USDT\n"
+                  f"Пополнение 1 USD GameAU: {p['usdt_per_usd']} USDT\n"
+                  f"Целевая чистая маржа: {p['margin']}%\nДоп. расходы от выручки: {p['extra_percent']}%\n\n"
+                  "Расчёт по каждому лоту — в разделе «Цены лотов».",
+                  [[("🔴 Выключить автоцены" if p["enabled"] else "🟢 Включить автоцены", "price_toggle")],
+                   [("📈 Маржа и расходы", "price_profit"), ("🔁 Источник курса", "price_source")],
+                   [("💱 Ручной курс USDT", "price_rate"), ("🧮 Сумма вывода", "price_withdraw")],
+                   [("💳 USDT за 1 USD GameAU", "price_fund")],
+                   [("📦 Цены лотов", "price_list:0"), ("🏠 Меню", "home")]])
+
+    def pricing_list(self, ctx, page):
+        cfg = self.e.config.snapshot()
+        lots = list(cfg["lots"])
+        rows = []
+        lines = ["📦 Цены привязанных лотов"]
+        for lid in lots[page * 8:page * 8 + 8]:
+            mode = "ручная" if lid in cfg["pricing"]["manual_lots"] else "авто"
+            _, status = self.e.pricing.status.get(lid, (0, "ещё не проверен"))
+            rows.append([(f"#{lid} · {mode}", f"price:{lid}")])
+            lines.append(f"#{lid} · {mode} · {status}")
+        nav = []
+        if page > 0:
+            nav.append(("⬅️", f"price_list:{page - 1}"))
+        if len(lots) > (page + 1) * 8:
+            nav.append(("➡️", f"price_list:{page + 1}"))
+        if nav:
+            rows.append(nav)
+        self.show(ctx, "\n".join(lines), rows + [[("◀️ Цены и комиссии", "pricing")]])
+
+    def price_preview(self, ctx, preview, manual=False):
+        lid = preview["lot"]
+        currency = preview["currency"]
+        unit = currency.name
+        current, target = preview["current"], preview["target"]
+        self.price_previews[self.key(ctx)] = (preview, manual)
+        text = f"💸 Лот #{lid}, за одну штуку\nТекущая цена продавца: {current:f} {unit}\n"
+        text += f"{'Ручная' if manual else 'Расчётная'} цена продавца: {target:.2f} {unit}\n"
+        if not manual:
+            text += (f"Закупка GameAU: {preview['price_usd']:f} USD = {preview['usdt']:.4f} USDT\n"
+                     f"Эффективный курс: {preview['rate']:.4f} {unit}/USDT\n")
+            if preview["withdrawal"]:
+                debit, receive = preview["withdrawal"]
+                text += (f"Расчёт вывода с комиссией и конвертацией: {debit:f} {unit} → {receive:f} USDT\n"
+                         f"Эквивалент поступления после вывода: {target / preview['rate']:.4f} USDT\n")
+            else:
+                text += "Источник курса: вручную, с учётом расходов, включённых в ваш курс.\n"
+            text += (f"Себестоимость: {preview['cost']:.4f} {unit}\n"
+                     f"Доп. расходы на продажу: {preview['fee']:.4f} {unit}\n"
+                     f"Выручка после доп. расходов: {preview['net']:.4f} {unit}\n"
+                     f"Чистая прибыль: {preview['profit']:.4f} {unit}\n"
+                     f"Маржа: {preview['margin']:.2f}% · цель {preview['desired']}%\n"
+                     f"Маржа при текущей цене: {preview['old_margin']:.2f}%\n")
+        text += "\nПокупатель платит с комиссиями FunPay и способа оплаты\n"
+        previous = {(m.name, m.currency.name): number(m.price) for m in preview.get("old_methods", [])}
+        for method in preview["methods"]:
+            total = number(method.price)
+            old = previous.get((method.name, method.currency.name))
+            start = f"{old:.2f} → " if old is not None else ""
+            fee = f" (+{total - target:.2f} {unit})" if method.currency == currency and total >= target else ""
+            text += f"• {str(method.name or 'Способ оплаты')[:45]}: {start}{total:.2f} {method.currency.name}{fee}\n"
+        if manual:
+            text += "\nСохранение переведёт этот лот на ручную цену."
+        self.show(ctx, text, [[("💾 Сохранить цену на FunPay", f"price_save:{lid}")],
+                              [("◀️ К лоту", f"price:{lid}")]])
+
+    def price_input(self, ctx, step, text, data):
+        cfg = self.e.config.snapshot()
+        p = cfg["pricing"]
+        values = text.replace(",", ".").split()
+        if step == "price_manual":
+            preview = self.e.pricing.manual_preview(data["lot_id"], number(text.replace(",", ".")))
+            self.pending.pop(self.key(ctx), None)
+            self.price_preview(ctx, preview, manual=True)
+            return
+        if step == "price_rate":
+            if len(values) != 2 or values[0].upper() not in LOT_CURRENCIES:
+                raise PluginError("Формат: RUB 94.50, USD 1.05 или EUR 0.95.")
+            p["manual_rates"][values[0].upper()] = str(number(values[1]))
+            p["source"] = "manual"
+        elif step == "price_profit":
+            if len(values) not in {1, 2}:
+                raise PluginError("Введите маржу и доп. расходы через пробел, например 12 1.5.")
+            p["margin"] = str(number(values[0], zero=True))
+            if len(values) == 2:
+                p["extra_percent"] = str(number(values[1], zero=True))
+        else:
+            p[{"price_withdraw": "withdraw_usdt", "price_fund": "usdt_per_usd"}[step]] = str(number(text.replace(",", ".")))
+        self.e.config.save(cfg)
+        self.e.pricing.checked.clear()
+        self.pending.pop(self.key(ctx), None)
+        self.pricing_menu(ctx)
+
     def input(self, message):
         if not self.has_input(message):
             return
@@ -1211,7 +1531,9 @@ class Panel:
         try:
             cfg = self.e.config.snapshot()
             d = self.drafts.get(self.key(ctx), {})
-            if step == "key":
+            if step.startswith("price_"):
+                self.price_input(ctx, step, text, p["data"])
+            elif step == "key":
                 if len(text) < 8 or len(text) > 1024 or any(c.isspace() for c in text):
                     raise PluginError("Неверный формат API-ключа.")
                 if os.environ.get("GAMEAU_API_KEY"):
@@ -1331,6 +1653,70 @@ class Panel:
         key = self.key(ctx)
         if name == "home":
             self.home(ctx)
+        elif name == "pricing":
+            self.pricing_menu(ctx)
+        elif name == "price_list":
+            self.pricing_list(ctx, int(arg))
+        elif name == "price_toggle":
+            p = cfg["pricing"]
+            p["enabled"] = not p["enabled"]
+            self.e.config.save(cfg)
+            self.e.pricing.checked.clear()
+            self.pricing_menu(ctx)
+        elif name == "price_source":
+            self.show(ctx, "Выберите источник стоимости USDT для расчёта маржи.",
+                      [[("Вывод FunPay в USDT TRC20", "price_use:funpay")],
+                       [("Мой курс USDT", "price_use:manual")], [("◀️ Цены и комиссии", "pricing")]])
+        elif name == "price_use":
+            cfg["pricing"]["source"] = arg
+            self.e.config.save(cfg)
+            self.e.pricing.checked.clear()
+            self.pricing_menu(ctx)
+        elif name in {"price_profit", "price_rate", "price_withdraw", "price_fund", "price_manual"}:
+            prompt = {
+                "price_profit": "Введите целевую маржу в процентах. Можно через пробел добавить собственные расходы "
+                                "в % от выручки продавца. Пример: 12 1.5. Маржа = прибыль / чистая выручка.",
+                "price_rate": "Укажите валюту лота и фактическую стоимость 1 USDT с комиссиями вашего обменника. "
+                              "Пример: RUB 94.50. Сохранение включает ручной источник курса.",
+                "price_withdraw": "Сколько USDT вы обычно получаете за один вывод? Введите сумму, например 100. "
+                                  "От суммы зависит доля фиксированной комиссии вывода.",
+                "price_fund": "Сколько USDT вы тратите, чтобы получить 1 USD на балансе GameAU? "
+                              "Например, 1.02 учитывает расходы пополнения в размере 2%.",
+                "price_manual": "Введите цену продавца за одну штуку в валюте лота. Проверьте вкладку и подтвердите сохранение.",
+            }[name]
+            self.begin(ctx, name, prompt, lot_id=arg)
+        elif name == "price":
+            fields = self.e.pricing.lot_fields(arg)
+            manual = arg in cfg["pricing"]["manual_lots"]
+            text = (f"💸 Лот #{arg}\nЦена продавца: {fields.price} {fields.currency.name}\n"
+                    + ("Ручная цена" if manual else "Следует общей настройке автоцен"))
+            last = self.e.pricing.status.get(arg)
+            if last:
+                text += f"\nПоследняя проверка автоцены: {last[1]}"
+            self.show(ctx, text, [[("🧮 Свежий расчёт и комиссии", f"price_calc:{arg}")],
+                                  [("✍️ Ввести цену вручную", f"price_manual:{arg}")],
+                                  [("🟢 Разрешить автоцену" if manual else "⏸ Приостановить автоцену", f"price_lot:{arg}")],
+                                  [("◀️ Цены лотов", "price_list:0")]])
+        elif name == "price_lot":
+            if arg not in cfg["lots"]:
+                raise PluginError("Лот больше не привязан к GameAU.")
+            manual_lots = cfg["pricing"]["manual_lots"]
+            if arg in manual_lots:
+                manual_lots.remove(arg)
+            else:
+                manual_lots.append(arg)
+            self.e.config.save(cfg)
+            self.e.pricing.checked.pop(arg, None)
+            self.route(ctx, f"price:{arg}")
+        elif name == "price_calc":
+            self.price_preview(ctx, self.e.pricing.calculate(arg))
+        elif name == "price_save":
+            preview, manual = self.price_previews.pop(key, ({}, False))
+            if preview.get("lot") != arg:
+                raise PluginError("Сначала откройте свежий расчёт.")
+            changed = self.e.pricing.apply(preview, manual=manual)
+            self.show(ctx, "Цена сохранена на FunPay." if changed else "На FunPay уже установлена эта цена.",
+                      [[("◀️ К лоту", f"price:{arg}")]])
         elif name == "toggle":
             self.e.bind_account()
             cfg = self.e.config.snapshot()
@@ -1468,6 +1854,8 @@ class Panel:
             self.lot(ctx, arg)
         elif name == "unbind":
             cfg["lots"].pop(arg, None)
+            if arg in cfg["pricing"]["manual_lots"]:
+                cfg["pricing"]["manual_lots"].remove(arg)
             self.e.config.save(cfg)
             self.lot(ctx, arg)
         elif name == "orders":
