@@ -166,6 +166,92 @@ def test_ready_order_from_an_earlier_version_asks_for_confirmation(setup, monkey
     assert "Логин Steam: steam_user" in s.sent[-1][1] and not s.api.calls
 
 
+@pytest.mark.parametrize("status", ["completed", "failed"])
+def test_steam_chat_uses_saved_templates_and_reports_only_success(setup, monkeypatch, status):
+    s = setup
+    cfg = s.e.config.snapshot()
+    cfg["lots"]["123"] = dict(rule("steamTopup"), params={"currency": "UAH", "amount": 1}, max_units=100)
+    s.e.config.save(cfg)
+    s.e.panel.home(s.e.panel.context(message()))
+    click(s.e, "steam_messages")
+    click(s.e, "steam_msg_edit:confirm")
+    s.e.panel.input(message("Сверьте данные заказа {order_id}."))
+    click(s.e, "steam_msg_edit:done")
+    s.e.panel.input(message("Готово #{order_id}: {login}, {amount} {currency} за {quantity} шт."))
+    assert p.Config(s.root).snapshot()["steam_messages"] == s.e.config.snapshot()["steam_messages"]
+
+    s.full.player = "steam_user"
+    s.full.amount = 100
+    original = s.api.call
+
+    def call(path, *args, **kwargs):
+        result = original(path, *args, **kwargs)
+        if path.startswith("/orders/status/"):
+            result["order"]["keys"] = []
+        return result
+
+    monkeypatch.setattr(s.api, "call", call)
+    s.e.new_order(s.event)
+    row = s.e.ledger.get("ORDER1")
+    text = s.sent[-1][1]
+    assert text.startswith("Сверьте данные заказа ORDER1.")
+    assert "Логин Steam: steam_user" in text and "100 UAH" in text
+    command = f"!gameau ORDER1 да {row['nonce']}"
+    assert command in text and "!gameau ORDER1 заново" in text
+    s.e.message(NS(text=command, chat_id=10, author_id=5))
+    assert len(s.sent) == 1 and s.e.ledger.get("ORDER1")["state"] == "pending"
+
+    s.api.status = status
+    s.e.poll(s.e.ledger.get("ORDER1"))
+    s.e.tick()
+    if status == "completed":
+        assert s.e.ledger.get("ORDER1")["state"] == "done"
+        assert [entry[1] for entry in s.sent[1:]] == ["Готово #ORDER1: steam_user, 100 UAH за 100 шт."]
+    else:
+        assert s.e.ledger.get("ORDER1")["state"] == "failed" and len(s.sent) == 1
+
+    click(s.e, "steam_msg_reset")
+    assert s.e.config.snapshot()["steam_messages"] == p.STEAM_MESSAGE_DEFAULTS
+
+
+@pytest.mark.parametrize("result_id, result_status, state", [
+    ("ord-topup-a19", " COMPLETED ", "done"),
+    ("ord-topup-other", "completed", "pending"),
+    ("ord-topup-a19", "mystery", "pending"),
+])
+def test_steam_polls_order_id_even_if_purchase_response_has_no_recognized_status(
+        setup, monkeypatch, result_id, result_status, state):
+    s = setup
+    cfg = s.e.config.snapshot()
+    cfg["lots"]["123"] = rule("steamTopup")
+    s.e.config.save(cfg)
+    s.full.player = "steam_user"
+    original = s.api.call
+
+    def call(path, *args, **kwargs):
+        if path == "/orders/status/ord-topup-a19":
+            return {"ok": True, "order": {"orderId": result_id, "status": result_status}}
+        result = original(path, *args, **kwargs)
+        if path == "/orders/steamTopup":
+            result["order"].pop("id")
+            result["order"].pop("status")
+            result["order"]["orderId"] = "ord-topup-a19"
+        return result
+
+    monkeypatch.setattr(s.api, "call", call)
+    s.e.new_order(s.event)
+    row = s.e.ledger.get("ORDER1")
+    s.e.message(NS(text=f"!gameau ORDER1 да {row['nonce']}", chat_id=10, author_id=5))
+    s.e.tick()
+    row = s.e.ledger.get("ORDER1")
+    assert row["state"] == state and row["remote_id"] == "ord-topup-a19" and len(s.api.orders) == 1
+    assert not any("запрос покупки требует сверки" in notification for notification in s.notifications)
+    if state == "done":
+        assert [entry[1].splitlines()[0] for entry in s.sent[1:]] == ["✅ Заказ #ORDER1 выполнен!"]
+    else:
+        assert len(s.sent) == 1 and row["error"]
+
+
 @pytest.mark.parametrize("refund_enabled", [False, True])
 def test_exceeding_uah_cap_stops_before_collecting_recipient(setup, refund_enabled):
     s = setup

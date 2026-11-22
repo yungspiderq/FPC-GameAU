@@ -38,10 +38,15 @@ KINDS = {"steamTopup": "Пополнение Steam", "steamGifts": "Игра Ste
 NAMES = {"steamLogin": "Логин Steam (не ник)", "invite_url": "Ссылка приглашения Steam",
          "telegram_username": "Username Telegram", "player_id": "ID игрока",
          "server_id": "ID сервера"}
+STEAM_MESSAGE_DEFAULTS = {
+    "confirm": "Заказ #{order_id}. Это ваш логин Steam?",
+    "done": "✅ Заказ #{order_id} выполнен!\nЛогин Steam: {login}\nСумма заказа: {amount} {currency}\nСпасибо за покупку!",
+}
+STEAM_MESSAGE_NAMES = {"confirm": "Подтверждение логина", "done": "Заказ выполнен"}
 DEFAULT = {"enabled": False, "dry_run": True, "api_key": "", "live_confirmed": False,
            "min_balance": "0", "lots": {}, "account_id": None,
            "guard_enabled": False, "guard_threshold": "0", "auto_refund": False,
-           "refund_reasons": ["price_limit"]}
+           "refund_reasons": ["price_limit"], "steam_messages": STEAM_MESSAGE_DEFAULTS}
 REFUND_REASONS = {
     "price_limit": "Цена выше лимита",
     "quantity": "Количество или сумма пополнения вне лимита",
@@ -340,6 +345,10 @@ class Config:
         number(data.get("guard_threshold"), zero=True)
         if not isinstance(data.get("api_key"), str) or not isinstance(data.get("lots"), dict):
             raise PluginError("Неверный формат настроек.")
+        messages = data.get("steam_messages", STEAM_MESSAGE_DEFAULTS)
+        if (not isinstance(messages, dict) or set(messages) != set(STEAM_MESSAGE_DEFAULTS)
+                or any(not isinstance(text, str) or not text.strip() or len(text) > 1000 for text in messages.values())):
+            raise PluginError("Введите текст сообщения длиной от 1 до 1000 символов.")
         for lot, rule in data["lots"].items():
             integer(lot, 10**15)
             validate_rule(rule)
@@ -1081,6 +1090,21 @@ class Engine:
         except PluginError as exc:
             self.notify(f"#{shortcut.id}: {exc}")
 
+    def steam_message(self, row, kind):
+        values = {
+            "order_id": row["id"],
+            "login": row["values"]["steamLogin"],
+            "amount": f"{steam_amount(row['rule'], row['units']).normalize():f}",
+            "currency": row["rule"]["params"]["currency"],
+            "quantity": str(row["units"]),
+        }
+        template = self.config.snapshot().get("steam_messages", STEAM_MESSAGE_DEFAULTS)[kind]
+        text = re.sub(r"\{(order_id|login|amount|currency|quantity)\}", lambda match: values[match[1]], template)[:2000]
+        if kind == "confirm":
+            text += (f"\nЛогин Steam: {values['login']}\n"
+                     f"Сумма пополнения: {values['amount']} {values['currency']} за {values['quantity']} шт.")
+        return text
+
     def ask(self, row):
         missing = [f for f in row["rule"]["inputs"] if f["path"] not in row["values"]]
         if missing:
@@ -1092,13 +1116,11 @@ class Engine:
                       f"Отправьте: !gameau {row['id']} ЗНАЧЕНИЕ\nПароль от аккаунта не нужен.")
         else:
             self.phase(row, "confirm", nonce=secrets.token_hex(3), confirm_until=time.time() + 900)
-            info = "; ".join(row["values"].values())
-            question = f"Заказ #{row['id']}. Проверьте получателя: {info}."
             if row["rule"]["kind"] == "steamTopup":
-                params = row["rule"]["params"]
-                amount = steam_amount(row["rule"], row["units"])
-                question = (f"Заказ #{row['id']}. Это ваш логин Steam?\nЛогин Steam: {info}\n"
-                            f"Сумма пополнения: {amount.normalize():f} {params['currency']} за {row['units']} шт.")
+                question = self.steam_message(row, "confirm")
+            else:
+                info = "; ".join(row["values"].values())
+                question = f"Заказ #{row['id']}. Проверьте получателя: {info}."
             self.tell(row, f"{question}\n"
                       f"Если всё верно, отправьте: !gameau {row['id']} да {row['nonce']}\n"
                       f"Чтобы исправить данные, отправьте: !gameau {row['id']} заново")
@@ -1337,10 +1359,13 @@ class Engine:
                 self.notify(f"#{row['id']}: {exc}")
 
     def validate_remote(self, order, row, expected_id=None):
-        if (not isinstance(order, dict) or not isinstance(order.get("id"), str)
-                or not re.fullmatch(r"ord-[0-9]+", order["id"]) or order.get("status") not in REMOTE_STATES
-                or (expected_id is not None and order["id"] != expected_id)):
-            raise PluginError("Не удалось подтвердить ID или статус заказа GameAU.")
+        if not isinstance(order, dict):
+            raise PluginError("В ответе GameAU отсутствуют данные заказа.")
+        remote_id = order.get("id") or order.get("orderId")
+        if not isinstance(remote_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", remote_id):
+            raise PluginError("GameAU не вернул корректный ID заказа.")
+        if expected_id is not None and remote_id != expected_id:
+            raise PluginError("GameAU вернул несовпадающий ID заказа.")
         for name in ("kind", "type"):
             if name in order and order[name] != row["rule"]["kind"]:
                 raise PluginError("Тип покупки не соответствует заказу.")
@@ -1352,6 +1377,7 @@ class Engine:
             for key, value in request.items():
                 if key in row["payload"] and value != row["payload"][key]:
                     raise PluginError("GameAU вернул другой товар или параметры покупки.")
+        return remote_id
 
     def create(self, row, first_attempt=False):
         if row["state"] not in {"creating", "uncertain"}:
@@ -1372,8 +1398,8 @@ class Engine:
                     return
                 raise
             order = data.get("order")
-            self.validate_remote(order, row)
-            self.phase(row, "pending", remote_id=order["id"], last_poll=0, error="")
+            remote_id = self.validate_remote(order, row)
+            self.phase(row, "pending", remote_id=remote_id, last_poll=0, error="")
             self.poll(row)
         except Exception as exc:
             error = str(exc) if isinstance(exc, PluginError) else "Не удалось разобрать ответ GameAU."
@@ -1392,7 +1418,10 @@ class Engine:
         self.ledger.put(row)
         order = self.api.call("/orders/status/" + quote(row["remote_id"], safe="")).get("order")
         self.validate_remote(order, row, row["remote_id"])
-        status = order["status"]
+        status = order.get("status")
+        status = status.strip().lower() if isinstance(status, str) else None
+        if status not in REMOTE_STATES:
+            raise PluginError("GameAU не вернул распознаваемый статус заказа.")
         if status in FAIL_STATES:
             self.phase(row, "failed", remote_status=status)
             self.notify(f"#{row['id']}: статус GameAU {status}. Проверьте баланс и заказ FunPay; возврат FunPay не выполнялся.")
@@ -1448,12 +1477,17 @@ class Engine:
                     raise PluginError("Число кодов/карт не совпадает с покупкой. Нужна ручная проверка.")
             if not content and row["rule"]["kind"] in {"giftcards", "gamekeys", "manual"}:
                 raise PluginError("Поставщик завершил заказ без данных для выдачи. Нужна ручная проверка.")
-            if not content:
+            steam = row["rule"]["kind"] == "steamTopup"
+            if not content and not steam:
                 content = "Поставщик подтвердил выполнение заказа. Проверьте пополнение или получение подарка."
             if len(content) > 40000:
                 raise PluginError("Слишком большой ответ для автоматической выдачи.")
-            chunks = row.get("chunks") or [f"Заказ #{row['id']} — результат:\n" + content[i:i+2500]
-                                            for i in range(0, len(content), 2500)]
+            chunks = row.get("chunks")
+            if not chunks:
+                chunks = [f"Заказ #{row['id']} — результат:\n" + content[i:i+2500]
+                          for i in range(0, len(content), 2500)]
+                if steam:
+                    chunks.insert(0, self.steam_message(row, "done"))
             self.phase(row, "completed", chunks=chunks)
             for idx in range(row.get("sent", 0), len(chunks)):
                 self.phase(row, "delivering", sent=idx)
@@ -1641,11 +1675,22 @@ class Panel:
                    [("🧪 Тест / реальные покупки", "mode")], [("🔑 API-ключ", "key"), ("💰 Баланс", "balance")],
                    [("📦 Мои лоты", "lots:0"), ("🛍 Каталог API", "catalog")],
                    [("🧾 Заказы", "orders:0"), ("🛡 Минимальный остаток", "reserve")],
+                   [("💬 Сообщения покупателям", "steam_messages")],
                    [("↩️ Автовозврат", "refund_settings")],
                    [("📉 Отключение лотов по балансу", "guard")],
                    [("💸 Цены и комиссии", "pricing")],
                    [("❓ Как настроить", "help"), ("🔄 Обновить меню", "home")],
                    [("◀️ К плагину", f"={CBT.EDIT_PLUGIN}:{UUID}:0")]])
+
+    def steam_messages(self, ctx, note=""):
+        templates = self.e.config.snapshot().get("steam_messages", STEAM_MESSAGE_DEFAULTS)
+        self.show(ctx, f"💬 Сообщения покупателям Steam{note}\n\n"
+                  f"Подтверждение логина\n{templates['confirm']}\n\n"
+                  f"Заказ выполнен\n{templates['done']}\n\n"
+                  "К запросу подтверждения бот добавляет логин, сумму и команды для ответа.",
+                  [[("✏️ Подтверждение логина", "steam_msg_edit:confirm")],
+                   [("✏️ Заказ выполнен", "steam_msg_edit:done")],
+                   [("↩️ Вернуть стандартные тексты", "steam_msg_reset")], [("🏠 Меню", "home")]])
 
     def begin(self, ctx, step, prompt, **data):
         self.pending[self.key(ctx)] = {"step": step, "data": data, "expires": time.time()+900}
@@ -1912,6 +1957,12 @@ class Panel:
                 self.price_input(ctx, step, text, p["data"])
             elif step in {"steam_units", "steam_cap"}:
                 self.steam_limit(ctx, step, p["data"]["target"], text)
+            elif step == "steam_msg_edit":
+                templates = cfg.setdefault("steam_messages", copy.deepcopy(STEAM_MESSAGE_DEFAULTS))
+                templates[p["data"]["kind"]] = text
+                self.e.config.save(cfg)
+                self.pending.pop(self.key(ctx), None)
+                self.steam_messages(ctx, " · сохранено")
             elif step == "key":
                 if len(text) < 8 or len(text) > 1024 or any(c.isspace() for c in text):
                     raise PluginError("Неверный формат API-ключа.")
@@ -2034,6 +2085,19 @@ class Panel:
         key = self.key(ctx)
         if name == "home":
             self.home(ctx)
+        elif name == "steam_messages":
+            self.steam_messages(ctx)
+        elif name == "steam_msg_edit" and arg in STEAM_MESSAGE_NAMES:
+            templates = cfg.get("steam_messages", STEAM_MESSAGE_DEFAULTS)
+            self.begin(ctx, name, f"✏️ {STEAM_MESSAGE_NAMES[arg]}\n\n"
+                       f"Текущий текст\n{templates[arg]}\n\n"
+                       "Отправьте новый текст длиной до 1000 символов.\n"
+                       "Подстановки: {order_id} — номер, {login} — логин, {amount} — сумма, "
+                       "{currency} — валюта, {quantity} — количество штук.", kind=arg)
+        elif name == "steam_msg_reset":
+            cfg["steam_messages"] = copy.deepcopy(STEAM_MESSAGE_DEFAULTS)
+            self.e.config.save(cfg)
+            self.steam_messages(ctx, " · стандартные тексты восстановлены")
         elif name in {"steam_units", "steam_cap"}:
             r = self.drafts.get(key, {}).get("rule") if arg == "draft" else cfg["lots"].get(arg)
             if not r or r["kind"] != "steamTopup":
