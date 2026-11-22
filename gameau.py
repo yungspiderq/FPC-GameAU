@@ -51,6 +51,8 @@ REFUND_REASONS = {
 PRICE_DEFAULT = {"enabled": False, "source": "funpay", "margin": "10", "withdraw_usdt": "100",
                  "usdt_per_usd": "1", "extra_percent": "0", "manual_rates": {}, "manual_lots": []}
 PRICE_INTERVAL = 15 * 60
+STEAM_MAX_UNITS = 10**8
+STEAM_MAX_AMOUNT = Decimal("100000000")
 LOT_CURRENCIES = {"RUB", "USD", "EUR"}
 SUCCESS_STATES = {"success", "completed", "complete", "delivered"}
 FAIL_STATES = {"failed", "refunded", "cancelled", "canceled", "rejected"}
@@ -137,12 +139,14 @@ def validate_rule(rule):
         raise PluginError("Неизвестный тип товара или параметры.")
     kind, p = r["kind"], r["params"]
     r["max_cost"] = str(usd(r.get("max_cost")))
-    r["max_units"] = integer(r.get("max_units", 1), 100)
+    r["max_units"] = integer(r.get("max_units", 1), STEAM_MAX_UNITS if kind == "steamTopup" else 100)
     r["quantity"] = integer(r.get("quantity", 1), 100)
     if type(r.get("enabled", True)) is not bool:
         raise PluginError("Неверный переключатель лота.")
-    if kind not in {"giftcards", "gamekeys"} and (r["quantity"] != 1 or r["max_units"] != 1):
-        raise PluginError("Для пополнений, подарков и услуг разрешена одна штука лота за заказ.")
+    if kind not in {"giftcards", "gamekeys"} and r["quantity"] != 1:
+        raise PluginError("Для этого типа товара quantity должен быть равен 1.")
+    if kind not in {"giftcards", "gamekeys", "steamTopup"} and r["max_units"] != 1:
+        raise PluginError("Для этого типа товара разрешена одна штука лота за заказ.")
     fields = {"gamekeys": {"game_id", "key_id"}, "giftcards": {"category_id", "card_id"},
               "topups": {"category_id", "offer_id", "fields"},
               "manual": {"manual_service_id", "product_id", "fields"},
@@ -160,9 +164,17 @@ def validate_rule(rule):
         p["sub_id"] = integer(p.get("sub_id"), 10**12)
     if kind == "steamTopup":
         amount = number(p.get("amount"))
-        if amount > 10**8 or p.get("currency") not in {"USD", "RUB", "UAH", "KZT"}:
+        if amount > STEAM_MAX_AMOUNT or p.get("currency") not in {"USD", "RUB", "UAH", "KZT"}:
             raise PluginError("Проверьте сумму и валюту Steam.")
         p["amount"] = float(amount)
+        if p["amount"] == 0:
+            raise PluginError("Сумма Steam слишком мала.")
+        limit = number(r.get("max_topup_amount", "0"), zero=True)
+        if limit > STEAM_MAX_AMOUNT:
+            raise PluginError(f"Лимит суммы пополнения должен быть не больше {STEAM_MAX_AMOUNT:f}.")
+        if limit and limit < amount:
+            raise PluginError("Лимит пополнения должен быть не меньше суммы за одну штуку лота.")
+        r["max_topup_amount"] = str(limit)
     if kind == "telegramStars":
         p["quantity"] = integer(p.get("quantity"), 10000)
         if p["quantity"] < 50:
@@ -222,6 +234,29 @@ def recipient_value(field, text):
     return value
 
 
+def steam_amount(rule, units):
+    p = rule["params"]
+    amount = number(p["amount"]) * units
+    limit = number(rule.get("max_topup_amount", "0"), zero=True) or STEAM_MAX_AMOUNT
+    if amount > limit:
+        raise OrderRejection("quantity", f"Пополнение {amount.normalize():f} {p['currency']} "
+                             f"выше лимита {limit.normalize():f} {p['currency']} на заказ.")
+    return amount
+
+
+def order_limits(rule):
+    units = rule["max_units"]
+    text = (f"Лимит штук на заказ: {units}\n" if units != STEAM_MAX_UNITS
+            else "Количество берётся из заказа FunPay.\n")
+    if rule["kind"] == "steamTopup":
+        limit = number(rule.get("max_topup_amount", "0"), zero=True)
+        if limit:
+            text += f"Лимит суммы пополнения: {limit.normalize():f} {rule['params']['currency']} за заказ\n"
+        else:
+            text += "Лимит суммы пополнения: по правилам GameAU\n"
+    return text
+
+
 def make_payload(rule, units, values):
     r = validate_rule(rule)
     units = integer(units, r["max_units"])
@@ -234,6 +269,8 @@ def make_payload(rule, units, values):
             p[field["path"]] = value
     if r["kind"] in {"gamekeys", "giftcards"}:
         p["quantity"] = integer(r["quantity"] * units, 100)
+    elif r["kind"] == "steamTopup":
+        p["amount"] = float(steam_amount(r, units))
     return p
 
 
@@ -594,7 +631,13 @@ class Pricing:
         if kind in {"steamTopup", "steamGifts"}:
             p = rule["params"]
             keys = ("amount", "currency") if kind == "steamTopup" else ("app_id", "sub_id", "region")
-            data = self.e.api.call("/" + kind + "/quote", {key: p[key] for key in keys}).get("quote")
+            try:
+                data = self.e.api.call("/" + kind + "/quote", {key: p[key] for key in keys}).get("quote")
+            except APIError as exc:
+                if kind == "steamTopup" and exc.status == 422 and exc.code == "AMOUNT_TOO_LOW":
+                    raise PluginError("Одна штука лота ниже минимума расчёта GameAU. Укажите цену вручную. "
+                                      "Закупка проверяет общую сумму заказа.") from None
+                raise
             if not isinstance(data, dict) or data.get("charge_currency", "USD") != "USD":
                 raise PluginError("Неверная цена в расчёте GameAU.")
             price = usd(data.get("charge"))
@@ -859,6 +902,12 @@ class Engine:
                 self.reject(row, OrderRejection("quantity",
                             f"Куплено {units} шт. Принимается до {rule['max_units']} шт. за заказ."))
                 return
+            if rule["kind"] == "steamTopup":
+                try:
+                    steam_amount(rule, units)
+                except OrderRejection as exc:
+                    self.reject(row, exc)
+                    return
             if rule["inputs"]:
                 self.ask(row)
             else:
@@ -879,7 +928,13 @@ class Engine:
         else:
             self.phase(row, "confirm", nonce=secrets.token_hex(3), confirm_until=time.time() + 900)
             info = "; ".join(row["values"].values())
+            summary = ""
+            if row["rule"]["kind"] == "steamTopup":
+                params = row["rule"]["params"]
+                amount = steam_amount(row["rule"], row["units"])
+                summary = f"Пополнение Steam: {amount.normalize():f} {params['currency']} за {row['units']} шт.\n"
             self.tell(row, f"Заказ #{row['id']}. Проверьте получателя: {info}.\n"
+                      f"{summary}"
                       f"Подтвердите: !gameau {row['id']} да {row['nonce']}\n"
                       f"Для исправления: !gameau {row['id']} заново")
 
@@ -1028,7 +1083,7 @@ class Engine:
         binding = cfg["lots"].get(row["lot_id"])
         return (self.active() and cfg["live_confirmed"] and not cfg["dry_run"] and not row["dry_run"]
                 and cfg["auto_refund"] and reason in cfg["refund_reasons"]
-                and binding and binding.get("enabled", True) and validate_rule(binding) == row["rule"])
+                and binding and binding.get("enabled", True) and validate_rule(binding) == validate_rule(row["rule"]))
 
     def reject(self, row, rejection, *, price_declined=False):
         unpurchased = (not row.get("remote_id") and
@@ -1345,7 +1400,7 @@ def rule_summary(rule):
     p = rule["params"]
     kind = rule["kind"]
     if kind == "steamTopup":
-        return f"Покупатель получит на Steam: {number(p['amount']):g} {p['currency']}"
+        return f"Пополнение Steam: {number(p['amount']).normalize():f} {p['currency']}"
     if kind == "telegramStars":
         return f"Покупатель получит: {p['quantity']} Stars"
     if kind == "telegramPremium":
@@ -1454,11 +1509,13 @@ class Panel:
             text += (f"{KINDS[r['kind']]}\n{'✅ Включён' if r.get('enabled', True) else '⛔ Выключен'}\n"
                      f"За 1 штуку лота:\n{rule_summary(r)}\n"
                      f"Максимальное списание за весь заказ: {r['max_cost']} USD\n"
-                     f"Плагин обработает до {r['max_units']} шт. в одном заказе FunPay.\n")
+                     f"{order_limits(r)}")
         else:
             text += "Не настроен."
         rows = [[("⚙️ Настроить по шагам", f"setup:{lid}")], [("📝 Настроить JSON", f"json:{lid}")]]
         if r:
+            if r["kind"] == "steamTopup":
+                rows.append([("📦 Лимит штук", f"steam_units:{lid}"), ("💵 Лимит пополнения", f"steam_cap:{lid}")])
             rows.append([("💸 Цена и комиссии", f"price:{lid}")])
             rows += [[("✅ / ⛔ Переключить", f"switch:{lid}")], [("🗑 Убрать привязку", f"unbind:{lid}")]]
         self.show(ctx, text, rows + [[("◀️ Лоты", "lots:0")]])
@@ -1529,13 +1586,37 @@ class Panel:
     def preview(self, ctx):
         d = self.drafts[self.key(ctx)]
         r = validate_rule(d["rule"])
+        rows = []
+        if r["kind"] == "steamTopup":
+            rows.append([("📦 Лимит штук", "steam_units:draft"), ("💵 Лимит пополнения", "steam_cap:draft")])
         self.show(ctx, f"Проверьте привязку лота {d['lot_id']}\n\n{KINDS[r['kind']]}\n"
                   f"За 1 штуку лота:\n{rule_summary(r)}\n"
                   f"Максимальное списание за заказ: {r['max_cost']} USD\n"
-                  f"Максимум штук в заказе: {r['max_units']}\n"
+                  f"{order_limits(r)}"
                   f"Данные от покупателя: {', '.join(f.get('label', f['path']) for f in r['inputs']) or 'не нужны'}\n\n"
                   "Проверьте регион товара. Сохранение не выполняет покупку.",
-                  [[("💾 Сохранить", "save")], [("❌ Отмена", "home")]])
+                  rows + [[("💾 Сохранить", "save")], [("❌ Отмена", "home")]])
+
+    def steam_limit(self, ctx, step, target, text):
+        cfg = self.e.config.snapshot()
+        draft = self.drafts.get(self.key(ctx), {})
+        r = copy.deepcopy(draft.get("rule") if target == "draft" else cfg["lots"].get(target))
+        if not r or r["kind"] != "steamTopup":
+            raise PluginError("Сначала настройте пополнение Steam.")
+        if step == "steam_units":
+            r["max_units"] = STEAM_MAX_UNITS if text == "0" else integer(text, STEAM_MAX_UNITS)
+        else:
+            r["max_topup_amount"] = str(number(text.replace(",", "."), zero=True))
+        validated = validate_rule(r)
+        self.pending.pop(self.key(ctx), None)
+        if target == "draft":
+            draft["rule"] = validated
+            self.preview(ctx)
+        else:
+            cfg["lots"][target] = validated
+            self.e.config.save(cfg)
+            self.e.pricing.checked.pop(target, None)
+            self.lot(ctx, target)
 
     def pricing_menu(self, ctx):
         cfg = self.e.config.snapshot()
@@ -1651,6 +1732,8 @@ class Panel:
             d = self.drafts.get(self.key(ctx), {})
             if step.startswith("price_"):
                 self.price_input(ctx, step, text, p["data"])
+            elif step in {"steam_units", "steam_cap"}:
+                self.steam_limit(ctx, step, p["data"]["target"], text)
             elif step == "key":
                 if len(text) < 8 or len(text) > 1024 or any(c.isspace() for c in text):
                     raise PluginError("Неверный формат API-ключа.")
@@ -1773,6 +1856,20 @@ class Panel:
         key = self.key(ctx)
         if name == "home":
             self.home(ctx)
+        elif name in {"steam_units", "steam_cap"}:
+            r = self.drafts.get(key, {}).get("rule") if arg == "draft" else cfg["lots"].get(arg)
+            if not r or r["kind"] != "steamTopup":
+                raise PluginError("Сначала настройте пополнение Steam.")
+            if name == "steam_units":
+                prompt = ("Введите максимум штук в одном заказе.\n"
+                          "0 — брать количество из заказа FunPay в пределах суммы пополнения и правил GameAU.\n"
+                          "Например, если одна штука = 1 UAH, заказ на 100 штук даст пополнение на 100 UAH.")
+            else:
+                unit = r["params"]["currency"]
+                prompt = (f"Введите максимальную сумму одного пополнения в {unit}.\n"
+                          f"Например, 10000 — не более 10 000 {unit} за заказ.\n"
+                          "0 — убрать отдельный лимит суммы. Лимит списания USD задаётся отдельно.")
+            self.begin(ctx, name, prompt, target=arg)
         elif name in {"refund_settings", "refund_toggle", "refund_reason"}:
             if name == "refund_toggle":
                 cfg["auto_refund"] = not cfg["auto_refund"]
@@ -1950,7 +2047,7 @@ class Panel:
                 if (catalog.get("steam_topup") or {}).get("available") is not True:
                     raise PluginError("Пополнение Steam временно недоступно.")
                 self.begin(ctx, "steam", "Сколько получает покупатель за ОДНУ штуку лота?\n"
-                           "Пример: 100 RUB — пополнение Steam примерно на 100 рублей с округлением по курсу.\n"
+                           "Пример: 1 UAH за штуку. При покупке 100 штук плагин запросит одно пополнение на 100 UAH.\n"
                            "Валюты: USD, RUB, UAH, KZT. Списываются USD с GameAU.")
             elif arg == "steamGifts":
                 self.begin(ctx, "gift_app", "Введите app_id игры Steam.\n"

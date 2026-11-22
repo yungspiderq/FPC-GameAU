@@ -173,7 +173,7 @@ def test_bad_money_rejected(value):
         p.number(value)
 
 
-@pytest.mark.parametrize("kind", ["steamTopup", "steamGifts", "telegramStars", "telegramPremium", "topups", "manual"])
+@pytest.mark.parametrize("kind", ["steamGifts", "telegramStars", "telegramPremium", "topups", "manual"])
 def test_service_does_not_silently_ignore_funpay_quantity(kind):
     r = rule(kind)
     r["max_units"] = 2
