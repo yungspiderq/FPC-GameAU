@@ -333,6 +333,58 @@ def test_ambiguous_lot_is_not_guessed(setup):
     assert not setup.api.orders
 
 
+@pytest.mark.parametrize("hint", [None, 123])
+def test_detailed_order_description_identifies_the_right_lot(setup, hint):
+    s = setup
+    cfg = s.e.config.snapshot()
+    cfg["lots"]["124"] = cfg["lots"].pop("123")
+    s.e.config.save(cfg)
+    s.lots[124] = copy.copy(s.lots[123])
+    s.lots[124].id = 124
+    s.event.lot_id = hint
+    s.event.order.subcategory = s.full.subcategory
+    s.full.full_description = "Steam  Украина\n1 UAH за штуку"
+    details = {123: "Steam Казахстан 1 KZT за штуку", 124: "Steam Украина 1\u00a0UAH за штуку"}
+    s.c.account.get_lot_fields = lambda lid: NS(lot_id=lid, description_ru=details[lid], auto_delivery=False)
+    s.e.new_order(s.event)
+    row = s.e.ledger.get("ORDER1")
+    assert row["lot_id"] == "124" and row["state"] == "pending"
+    assert len(s.api.orders) == 1
+
+
+@pytest.mark.parametrize("problem", ["same_description", "unreadable", "native_delivery"])
+def test_detailed_description_cannot_override_ambiguous_or_native_lot(setup, problem):
+    s = setup
+    s.lots[124] = copy.copy(s.lots[123])
+    s.lots[124].id = 124
+    s.full.full_description = "Steam Украина"
+
+    def fields(lid):
+        if lid == 124 and problem == "unreadable":
+            raise TimeoutError
+        text = s.full.full_description if lid == 123 or problem == "same_description" else "Steam Казахстан"
+        return NS(lot_id=lid, description_ru=text, auto_delivery=lid == 123 and problem == "native_delivery")
+
+    s.c.account.get_lot_fields = fields
+    s.e.new_order(s.event)
+    assert not s.api.orders
+    assert s.e.ledger.get("ORDER1") is None
+    if problem == "same_description":
+        assert "#123, #124" in s.notifications[-1]
+
+
+def test_order_description_can_be_verified_in_another_locale(setup):
+    s = setup
+    s.full.short_description = "Steam balance"
+    s.full.full_description = "Ukraine, one UAH per item"
+    translations = {("summary", "ru"): s.lots[123].description, ("desc", "ru"): "Украина, 1 UAH за штуку"}
+    s.full.get_field_value = lambda field, locale: translations.get((field, locale))
+    s.c.account.get_lot_fields = lambda lid: NS(lot_id=lid, description_ru=translations[("desc", "ru")],
+                                                auto_delivery=False)
+    s.e.new_order(s.event)
+    assert s.e.ledger.get("ORDER1")["lot_id"] == "123"
+
+
 def test_buyer_identity_and_confirmation(setup):
     s = setup
     cfg = s.e.config.snapshot()

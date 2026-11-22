@@ -12,6 +12,7 @@ import secrets
 import sqlite3
 import threading
 import time
+import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -22,7 +23,7 @@ from urllib.parse import quote, urlparse
 import requests
 
 NAME = "GameAU"
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 DESCRIPTION = "Автовыдача GameAU: Steam, Telegram, игры, ключи и карты. /gameau"
 CREDITS = "https://github.com/yungspiderq"
 UUID = "7dbcd7e7-2193-43db-a5bb-072eab977041"
@@ -101,6 +102,17 @@ def integer(value, maximum=100000):
 
 def fingerprint(key):
     return hashlib.sha256(key.encode()).hexdigest()
+
+
+def description_keys(*values):
+    return {" ".join(unicodedata.normalize("NFC", value).split())
+            for value in values if isinstance(value, str) and value.strip()}
+
+
+def same_subcategory(left, right):
+    if left is None or right is None or left.id != right.id:
+        return False
+    return getattr(left, "type", None) == getattr(right, "type", None)
 
 
 def usd(value):
@@ -925,34 +937,91 @@ class Engine:
             raise PluginError("Покупатель в чёрном списке Cardinal.")
         return o
 
+    def order_lot_candidates(self, order):
+        def compatible(lot_value, order_value):
+            lot_names = description_keys(lot_value)
+            order_names = description_keys(getattr(order_value, "name", None))
+            return not lot_names or not order_names or lot_names == order_names
+
+        return [lot for lot in self.c.profile.get_sorted_lots(1).values()
+                if same_subcategory(lot.subcategory, order.subcategory)
+                and compatible(lot.server, order.server) and compatible(lot.side, order.side)]
+
+    def match_order_lot(self, order, hint):
+        def read_descriptions(field, default):
+            read = getattr(order, "get_field_value", None)
+            values = [read(field, locale) for locale in ("ru", "en")] if callable(read) else []
+            return description_keys(default, *values)
+
+        summaries = read_descriptions("summary", order.short_description)
+        details = read_descriptions("desc", getattr(order, "full_description", None))
+        if not summaries and not details:
+            raise PluginError("В оплаченном заказе нет описания лота для сверки.")
+        candidates = self.order_lot_candidates(order)
+        shortlisted = [lot for lot in candidates if description_keys(lot.description) & summaries]
+        if not shortlisted:
+            self.refresh_lots()
+            candidates = self.order_lot_candidates(order)
+            shortlisted = [lot for lot in candidates if description_keys(lot.description) & summaries]
+        if len(shortlisted) == 1 and not details and str(shortlisted[0].id) == hint:
+            return shortlisted[0], False
+
+        matches = []
+        for lot in shortlisted or candidates:
+            try:
+                fields = self.c.account.get_lot_fields(int(lot.id))
+            except Exception:
+                raise PluginError(f"Не удалось сверить описание лота #{lot.id} на FunPay.") from None
+            if str(getattr(fields, "lot_id", lot.id)) != str(lot.id):
+                raise PluginError("FunPay вернул данные другого лота.")
+            titles = description_keys(lot.description, getattr(fields, "title_ru", None), getattr(fields, "title_en", None))
+            if summaries and not (titles & summaries):
+                continue
+            descriptions = description_keys(getattr(fields, "description_ru", None), getattr(fields, "description_en", None))
+            if details and not (descriptions & details):
+                continue
+            matches.append((lot, getattr(fields, "auto_delivery", False)))
+        if len(matches) == 1:
+            if str(matches[0][0].id) != hint and not details:
+                raise PluginError("Кардинал не подтвердил лот, а в заказе нет подробного описания для сверки.")
+            return matches[0]
+        if matches:
+            ids = ", ".join(f"#{lot.id}" for lot, _ in matches[:5])
+            raise PluginError(f"Заказ совпал по описанию с несколькими лотами: {ids}. Проверьте заказ вручную.")
+        raise PluginError("Описание из заказа FunPay не совпало с описанием лота. Проверьте краткое и подробное описание.")
+
     def new_order(self, event):
         if not self.active() or getattr(self.c, "old_mode_enabled", False):
             return
         shortcut = event.order
         if not re.fullmatch(r"[A-Z0-9]+", shortcut.id) or shortcut.id == "ADTEST" or self.ledger.get(shortcut.id):
             return
-        lid = str(getattr(event, "lot_id", ""))
         cfg = self.config.snapshot()
-        rule = cfg["lots"].get(lid)
-        if not rule or not rule.get("enabled", True):
+        enabled_lots = {lid for lid, rule in cfg["lots"].items() if rule.get("enabled", True)}
+        hint = str(getattr(event, "lot_id", ""))
+        if not enabled_lots or self.c.profile is None:
+            return
+        category = getattr(shortcut, "subcategory", None)
+        if hint not in enabled_lots and not any(str(lot.id) in enabled_lots and same_subcategory(lot.subcategory, category)
+                                               for lot in self.c.profile.get_sorted_lots(1).values()):
             return
         native = getattr(event, "config_section_obj", None)
         if getattr(event, "delivered", False) or (native is not None and not native.getboolean("disable")):
-            self.notify(f"#{shortcut.id}: отключите встроенную автовыдачу Cardinal у лота {lid}.")
+            self.notify(f"#{shortcut.id}: проверьте встроенную автовыдачу Cardinal для этого заказа.")
             return
         try:
-            lot = getattr(event, "lot_shortcut", None)
             o = self.c.account.get_order(shortcut.id)
-            if not lot or getattr(lot, "auto", False) or o.id != shortcut.id or o.buyer_id != shortcut.buyer_id:
-                raise PluginError("Не удалось проверить лот или включена автовыдача FunPay.")
-            candidates = [candidate for candidate in self.c.profile.get_sorted_lots(1).values()
-                          if candidate.description == o.short_description
-                          and getattr(candidate.subcategory, "id", None) == getattr(o.subcategory, "id", None)
-                          and (candidate.server or "") == (getattr(o.server, "name", None) or "")
-                          and (candidate.side or "") == (getattr(o.side, "name", None) or "")]
-            if len(candidates) != 1 or str(candidates[0].id) != lid:
-                raise PluginError("Неоднозначный лот. Используйте уникальные названия в категории/сервере.")
-            rule = validate_rule(rule)
+            if o.id != shortcut.id or o.buyer_id != shortcut.buyer_id or o.seller_id != self.c.account.id:
+                raise PluginError("Не удалось проверить продавца или покупателя заказа FunPay.")
+            lot, auto_delivery = self.match_order_lot(o, hint)
+            lid = str(lot.id)
+            if lid not in enabled_lots:
+                return
+            native_lot = getattr(event, "lot_shortcut", None)
+            if (getattr(lot, "auto", False) or auto_delivery
+                    or (lid == hint and getattr(native_lot, "auto", False))):
+                raise PluginError(f"У лота #{lid} включена штатная автовыдача FunPay.")
+            rule = validate_rule(cfg["lots"][lid])
             units = integer(o.amount, 10**15)
             if units != o.amount:
                 raise PluginError("FunPay не подтвердил количество в заказе.")
@@ -1555,7 +1624,8 @@ class Panel:
     def lots(self, ctx, page=0):
         lots = list(self.e.refresh_lots().values())
         cfg = self.e.config.snapshot()
-        rows = [[(f"{'✅' if str(lot.id) in cfg['lots'] else '➕'} {lot.id} · {lot.description[:30]}", f"lot:{lot.id}")]
+        rows = [[(f"{'✅' if str(lot.id) in cfg['lots'] else '➕'} {lot.id} · "
+                  f"{(lot.description or 'Без краткого описания')[:30]}", f"lot:{lot.id}")]
                 for lot in lots[page*8:page*8+8]]
         # Include configured inactive lots: their settings must remain reachable.
         missing = [lid for lid in cfg["lots"] if int(lid) not in self.e.lot_cache]
