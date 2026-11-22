@@ -31,7 +31,7 @@ def test_checkout_amount_is_the_sum_of_all_purchased_units(setup, units):
 
 
 @pytest.mark.parametrize("use_player", [True, False])
-def test_paid_checkout_login_is_used_without_chat_confirmation(setup, use_player):
+def test_paid_checkout_login_waits_for_buyer_confirmation(setup, use_player):
     s = setup
     cfg = s.e.config.snapshot()
     cfg["lots"]["123"] = dict(rule("steamTopup"), params={"currency": "UAH", "amount": 1}, max_units=100)
@@ -44,12 +44,29 @@ def test_paid_checkout_login_is_used_without_chat_confirmation(setup, use_player
         s.full.fields = {"custom": NS(name="Логин Steam", value={"ru": "001steam_user", "en": "001steam_user"})}
     s.e.new_order(s.event)
     s.e.new_order(s.event)
+    s.e.tick()
+
+    row = s.e.ledger.get("ORDER1")
+    assert row["state"] == "confirm" and not s.api.calls
+    assert len(s.sent) == 1
+    prompt = s.sent[0][1]
+    assert "Это ваш логин Steam?" in prompt and "Логин Steam: 001steam_user" in prompt and "100 UAH" in prompt
+    command = f"!gameau ORDER1 да {row['nonce']}"
+    assert command in prompt
+    s.e.message(NS(text=command, chat_id=10, author_id=6))
+    s.e.message(NS(text=command, chat_id=11, author_id=5))
+    s.e.message(NS(text="!gameau ORDER1 да", chat_id=10, author_id=5))
+    assert not s.api.calls
+
+    confirmation = NS(text=command, chat_id=10, author_id=5)
+    s.e.message(confirmation)
+    s.e.message(confirmation)
 
     quote, purchase = [body for path, body, _ in s.api.calls
                        if path in {"/steamTopup/quote", "/orders/steamTopup"}]
     for payload in (quote, purchase):
         assert (payload["steamLogin"], payload["amount"], payload["currency"]) == ("001steam_user", 100, "UAH")
-    assert len(s.api.orders) == 1 and not s.sent
+    assert len(s.api.orders) == 1
     assert s.e.ledger.get("ORDER1")["state"] == "pending"
 
 
@@ -86,10 +103,67 @@ def test_checkout_login_must_still_match_before_purchase(setup, monkeypatch):
 
     monkeypatch.setattr(s.api, "call", call)
     s.e.new_order(s.event)
+    row = s.e.ledger.get("ORDER1")
+    s.e.message(NS(text=f"!gameau ORDER1 да {row['nonce']}", chat_id=10, author_id=5))
 
     row = s.e.ledger.get("ORDER1")
-    assert row["state"] == "blocked" and "логин Steam" in row["error"]
+    assert row["state"] == "blocked" and "Логин Steam" in row["error"]
     assert not s.api.orders
+
+
+def test_buyer_can_replace_checkout_login_then_confirm(setup):
+    s = setup
+    cfg = s.e.config.snapshot()
+    cfg["lots"]["123"] = rule("steamTopup")
+    s.e.config.save(cfg)
+    s.full.player = "mistyped_user"
+    s.e.new_order(s.event)
+    s.full.player = "different_user"
+    s.e.message(NS(text="!gameau ORDER1 заново", chat_id=10, author_id=5))
+    assert "!gameau ORDER1 ЗНАЧЕНИЕ" in s.sent[-1][1]
+    s.e.message(NS(text="!gameau ORDER1 correct_user", chat_id=10, author_id=5))
+    row = s.e.ledger.get("ORDER1")
+    assert row["state"] == "confirm" and "Логин Steam: correct_user" in s.sent[-1][1]
+    assert not s.api.calls
+    s.e.message(NS(text=f"!gameau ORDER1 да {row['nonce']}", chat_id=10, author_id=5))
+    purchase = next(body for path, body, _ in s.api.calls if path == "/orders/steamTopup")
+    assert purchase["steamLogin"] == "correct_user"
+
+
+def test_expired_checkout_confirmation_requires_a_fresh_code(setup, monkeypatch):
+    s = setup
+    cfg = s.e.config.snapshot()
+    cfg["lots"]["123"] = rule("steamTopup")
+    s.e.config.save(cfg)
+    s.full.player = "steam_user"
+    codes = iter(("aaaaaa", "bbbbbb"))
+    monkeypatch.setattr(p.secrets, "token_hex", lambda _: next(codes))
+    s.e.new_order(s.event)
+    row = s.e.ledger.get("ORDER1")
+    s.e.phase(row, "confirm", confirm_until=0)
+    expired = NS(text="!gameau ORDER1 да aaaaaa", chat_id=10, author_id=5)
+    s.e.message(expired)
+    assert "!gameau ORDER1 да bbbbbb" in s.sent[-1][1]
+    s.e.message(expired)
+    assert s.e.ledger.get("ORDER1")["state"] == "confirm" and not s.api.calls
+    s.e.message(NS(text="!gameau ORDER1 да bbbbbb", chat_id=10, author_id=5))
+    assert len(s.api.orders) == 1
+
+
+def test_ready_order_from_an_earlier_version_asks_for_confirmation(setup, monkeypatch):
+    s = setup
+    cfg = s.e.config.snapshot()
+    cfg["lots"]["123"] = rule("steamTopup")
+    s.e.config.save(cfg)
+    s.full.player = "steam_user"
+    with monkeypatch.context() as patch:
+        patch.setattr(s.e, "process", lambda row: None)
+        s.e.new_order(s.event)
+
+    assert s.e.ledger.get("ORDER1")["state"] == "ready"
+    s.e.tick()
+    assert s.e.ledger.get("ORDER1")["state"] == "confirm"
+    assert "Логин Steam: steam_user" in s.sent[-1][1] and not s.api.calls
 
 
 @pytest.mark.parametrize("refund_enabled", [False, True])

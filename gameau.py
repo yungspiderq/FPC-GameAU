@@ -23,7 +23,7 @@ from urllib.parse import quote, urlparse
 import requests
 
 NAME = "GameAU"
-VERSION = "1.2.3"
+VERSION = "1.2.4"
 DESCRIPTION = "Автовыдача GameAU: Steam, Telegram, игры, ключи и карты. /gameau"
 CREDITS = "https://github.com/yungspiderq"
 UUID = "7dbcd7e7-2193-43db-a5bb-072eab977041"
@@ -947,7 +947,7 @@ class Engine:
         self.lot_cache = dict(lots)
         return lots
 
-    def verify_order(self, row, statuses=("PAID",)):
+    def verify_order(self, row, statuses=("PAID",), *, check_checkout_login=True):
         self.bind_account()
         o = self.c.account.get_order(row["id"])
         if (o.id != row["id"] or getattr(o.status, "name", "") not in statuses or o.seller_id != self.c.account.id
@@ -955,8 +955,9 @@ class Engine:
                 or o.short_description != row["description"] or o.amount != row["units"]
                 or getattr(o, "order_secrets", None)):
             raise PluginError("Заказ FunPay не оплачен, изменён, возвращён или уже выдан самим FunPay.")
-        if row.get("steam_login_from_order") and steam_login_from_order(o) != row["values"].get("steamLogin"):
-            raise PluginError("Не удалось повторно подтвердить логин Steam из оплаченного заказа.")
+        if (check_checkout_login and row.get("steam_login_from_order")
+                and steam_login_from_order(o) != row["values"].get("steamLogin")):
+            raise PluginError("Логин Steam в заказе изменился или недоступен.")
         if getattr(self.c, "bl_delivery_enabled", False) and row["buyer_name"] in self.c.blacklist:
             raise PluginError("Покупатель в чёрном списке Cardinal.")
         return o
@@ -1092,15 +1093,15 @@ class Engine:
         else:
             self.phase(row, "confirm", nonce=secrets.token_hex(3), confirm_until=time.time() + 900)
             info = "; ".join(row["values"].values())
-            summary = ""
+            question = f"Заказ #{row['id']}. Проверьте получателя: {info}."
             if row["rule"]["kind"] == "steamTopup":
                 params = row["rule"]["params"]
                 amount = steam_amount(row["rule"], row["units"])
-                summary = f"Пополнение Steam: {amount.normalize():f} {params['currency']} за {row['units']} шт.\n"
-            self.tell(row, f"Заказ #{row['id']}. Проверьте получателя: {info}.\n"
-                      f"{summary}"
-                      f"Подтвердите: !gameau {row['id']} да {row['nonce']}\n"
-                      f"Для исправления: !gameau {row['id']} заново")
+                question = (f"Заказ #{row['id']}. Это ваш логин Steam?\nЛогин Steam: {info}\n"
+                            f"Сумма пополнения: {amount.normalize():f} {params['currency']} за {row['units']} шт.")
+            self.tell(row, f"{question}\n"
+                      f"Если всё верно, отправьте: !gameau {row['id']} да {row['nonce']}\n"
+                      f"Чтобы исправить данные, отправьте: !gameau {row['id']} заново")
 
     def message(self, msg):
         if not self.active() or getattr(msg, "by_bot", False) or getattr(msg, "badge", None):
@@ -1113,15 +1114,19 @@ class Engine:
                 or msg.author_id != row["buyer_id"] or str(msg.chat_id) != str(row["chat_id"])):
             return
         try:
-            self.verify_order(row)
             value = parts[2].strip()
-            if value.lower() == "заново":
-                self.phase(row, "collecting", values={})
+            restart = value.lower() == "заново"
+            self.verify_order(row, check_checkout_login=not restart)
+            if restart:
+                self.phase(row, "collecting", values={}, steam_login_from_order=False, buyer_confirmed=False)
                 self.ask(row)
             elif row["state"] == "confirm":
-                if value != "да " + row["nonce"] or time.time() > row["confirm_until"]:
-                    raise PluginError("Неверное/устаревшее подтверждение. Отправьте !gameau НОМЕР_ЗАКАЗА заново.")
-                self.phase(row, "ready")
+                if value != "да " + row["nonce"]:
+                    raise PluginError("Скопируйте команду подтверждения из последнего сообщения бота.")
+                if time.time() > row["confirm_until"]:
+                    self.ask(row)
+                    return
+                self.phase(row, "ready", buyer_confirmed=True)
                 self.process(row)
             else:
                 field = next(f for f in row["rule"]["inputs"] if f["path"] not in row["values"])
@@ -1305,6 +1310,9 @@ class Engine:
         try:
             self.same_key(row)
             self.verify_order(row)
+            if row.get("steam_login_from_order") and not row.get("buyer_confirmed"):
+                self.ask(row)
+                return
             payload, total = self.prepare(row)
             cfg = self.config.snapshot()
             row["quoted_usd"] = str(total)
