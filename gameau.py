@@ -22,7 +22,7 @@ from urllib.parse import quote, urlparse
 import requests
 
 NAME = "GameAU"
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 DESCRIPTION = "Автовыдача GameAU: Steam, Telegram, игры, ключи и карты. /gameau"
 CREDITS = "https://github.com/yungspiderq"
 UUID = "7dbcd7e7-2193-43db-a5bb-072eab977041"
@@ -53,6 +53,8 @@ PRICE_DEFAULT = {"enabled": False, "source": "funpay", "margin": "10", "withdraw
 PRICE_INTERVAL = 15 * 60
 STEAM_MAX_UNITS = 10**8
 STEAM_MAX_AMOUNT = Decimal("100000000")
+STEAM_BILL_STEP = Decimal("0.01")
+STEAM_CHARGE_STEP = Decimal("0.0001")
 LOT_CURRENCIES = {"RUB", "USD", "EUR"}
 SUCCESS_STATES = {"success", "completed", "complete", "delivered"}
 FAIL_STATES = {"failed", "refunded", "cancelled", "canceled", "rejected"}
@@ -635,8 +637,7 @@ class Pricing:
                 data = self.e.api.call("/" + kind + "/quote", {key: p[key] for key in keys}).get("quote")
             except APIError as exc:
                 if kind == "steamTopup" and exc.status == 422 and exc.code == "AMOUNT_TOO_LOW":
-                    raise PluginError("Одна штука лота ниже минимума расчёта GameAU. Укажите цену вручную. "
-                                      "Закупка проверяет общую сумму заказа.") from None
+                    return self.steam_batch_cost(rule)
                 raise
             if not isinstance(data, dict) or data.get("charge_currency", "USD") != "USD":
                 raise PluginError("Неверная цена в расчёте GameAU.")
@@ -645,7 +646,73 @@ class Pricing:
             price = self.e.catalog_cost(rule, 1)
         if price > usd(rule["max_cost"]):
             raise PluginError("Закупка за одну штуку превысила лимит GameAU для заказа. Проверьте привязку.")
-        return price
+        return price, None
+
+    def steam_batch_cost(self, rule):
+        rule = validate_rule(rule)
+        params = rule["params"]
+        unit_amount, currency = number(params["amount"]), params["currency"]
+        topup = self.e.catalog("steamTopup").get("steam_topup")
+        if not isinstance(topup, dict) or topup.get("available") is not True or not isinstance(topup.get("rates"), dict):
+            raise PluginError("GameAU не подтвердил доступность курса пополнения Steam.")
+        rate = number(topup["rates"].get(currency))
+        multiplier = number(topup.get("price_multiplier"))
+        minimum = usd(topup.get("min_usd"))
+        maximum = usd(topup.get("max_usd"))
+        if minimum > maximum or multiplier > 1:
+            raise PluginError("GameAU вернул некорректные условия пополнения Steam.")
+
+        # Allow for the provider checking either the raw USD amount or the amount rounded up to cents.
+        # Below this quantity even the rounded amount is below the documented minimum.
+        lower_usd = minimum.quantize(STEAM_BILL_STEP, rounding=ROUND_CEILING) - STEAM_BILL_STEP
+        amount_limit = number(rule.get("max_topup_amount", "0"), zero=True) or STEAM_MAX_AMOUNT
+        total_limit = min(amount_limit, maximum * rate, rule["max_units"] * unit_amount)
+        if total_limit <= lower_usd * rate:
+            raise PluginError("В пределах настроенных лимитов нет суммы пополнения, которую принимает GameAU.")
+        lower_units = max(2, int((lower_usd * rate) // unit_amount) + 1)
+        maximum_units = int(total_limit // unit_amount)
+        if lower_units > maximum_units:
+            raise PluginError("В пределах настроенных лимитов нет суммы пополнения, которую принимает GameAU.")
+
+        raw_minimum_units = (min(minimum * rate, total_limit) / unit_amount).to_integral_value(rounding=ROUND_CEILING)
+        candidate_units = min(maximum_units, max(lower_units, int(raw_minimum_units)))
+        for quote_units in dict.fromkeys((lower_units, candidate_units)):
+            quote_amount = steam_amount(rule, quote_units)
+            try:
+                result = self.e.api.call("/steamTopup/quote", {"amount": float(quote_amount), "currency": currency})
+            except APIError as exc:
+                if exc.status == 422 and exc.code == "AMOUNT_TOO_LOW":
+                    continue
+                raise
+            break
+        else:
+            raise PluginError("GameAU не принял расчёт суммы пополнения. Проверьте лимиты лота и условия GameAU.")
+
+        data = result.get("quote")
+        if (not isinstance(data, dict) or data.get("charge_currency", "USD") != "USD"
+                or data.get("currency", currency) != currency or number(data.get("amount", quote_amount)) != quote_amount
+                or number(data.get("rate", rate)) != rate):
+            raise PluginError("Котировка пополнения Steam изменилась. Повторите расчёт.")
+
+        def charge(units):
+            billed = (unit_amount * units / rate).quantize(STEAM_BILL_STEP, rounding=ROUND_CEILING)
+            return (billed * multiplier).quantize(STEAM_CHARGE_STEP, rounding=ROUND_CEILING)
+
+        quoted = usd(data.get("charge"))
+        if quoted != charge(quote_units):
+            raise PluginError("Котировка GameAU не совпала с условиями тарифа. Повторите расчёт.")
+        if quoted > usd(rule["max_cost"]):
+            raise PluginError("Расчёт допустимого пополнения превышает лимит списания USD за заказ.")
+
+        # Check the smallest baskets where rounding costs most per unit. For larger orders,
+        # the first rounding adds less than a cent and the second less than 0.0001 USD.
+        last_checked = min(maximum_units, lower_units + 63)
+        price = max(charge(units) / units for units in range(lower_units, last_checked + 1))
+        if last_checked < maximum_units:
+            tail_cost = unit_amount / rate * multiplier
+            tail_cost += (STEAM_BILL_STEP * multiplier + STEAM_CHARGE_STEP) / (last_checked + 1)
+            price = max(price, tail_cost)
+        return price, {"units": quote_units, "amount": quote_amount, "currency": currency, "charge": quoted}
 
     def calculate(self, lid, fields=None):
         fields = fields or self.lot_fields(lid)
@@ -654,7 +721,7 @@ class Pricing:
         if not rule:
             raise PluginError("Сначала привяжите лот к товару GameAU.")
         cfg = config["pricing"]
-        price_usd = self.cost(rule)
+        price_usd, steam_basis = self.cost(rule)
         rate, withdrawal = self.rate(fields.currency, cfg)
         needed_usdt = price_usd * number(cfg["usdt_per_usd"])
         cost = needed_usdt * rate
@@ -672,7 +739,7 @@ class Pricing:
                 "old_margin": (old_net - cost) / old_net * 100, "desired": cfg["margin"],
                 "old_methods": getattr(getattr(fields, "calc_result", None), "methods", []),
                 "methods": self.buyer_prices(fields, target), "time": time.monotonic(),
-                "settings": cfg, "rule": rule, "key": fingerprint(self.e.api.key())}
+                "settings": cfg, "rule": rule, "key": fingerprint(self.e.api.key()), "steam_basis": steam_basis}
 
     def manual_preview(self, lid, price):
         fields = self.lot_fields(lid)
@@ -1666,8 +1733,13 @@ class Panel:
         text = f"💸 Лот #{lid}, за одну штуку\nТекущая цена продавца: {current:f} {unit}\n"
         text += f"{'Ручная' if manual else 'Расчётная'} цена продавца: {target:.2f} {unit}\n"
         if not manual:
-            text += (f"Закупка GameAU: {preview['price_usd']:f} USD = {preview['usdt']:.4f} USDT\n"
+            text += (f"Закупка GameAU за штуку: {preview['price_usd']:.6f} USD = {preview['usdt']:.6f} USDT\n"
                      f"Эффективный курс: {preview['rate']:.4f} {unit}/USDT\n")
+            basis = preview["steam_basis"]
+            if basis:
+                text += (f"Котировка GameAU: {basis['units']} шт. = {basis['amount'].normalize():f} "
+                         f"{basis['currency']} за {basis['charge']:f} USD.\n"
+                         "Себестоимость за штуку учитывает округление закупки для разных объёмов.\n")
             if preview["withdrawal"]:
                 debit, receive = preview["withdrawal"]
                 text += (f"Расчёт вывода с комиссией и конвертацией: {debit:f} {unit} → {receive:f} USDT\n"

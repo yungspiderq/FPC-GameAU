@@ -121,3 +121,84 @@ def test_steam_pricing_uses_quote_without_recipient(shop, kind):
     path, body, _ = shop.setup.api.calls[0]
     assert path == f"/{kind}/quote"
     assert set(body) == ({"amount", "currency"} if kind == "steamTopup" else {"app_id", "sub_id", "region"})
+
+
+def setup_small_steam_lot(shop, *, limit="10000", rounded_minimum=False, mismatched_quote=False):
+    cfg = shop.e.config.snapshot()
+    cfg["lots"]["123"] = dict(rule("steamTopup"), params={"amount": 1, "currency": "UAH"},
+                              max_units=p.STEAM_MAX_UNITS, max_topup_amount=limit)
+    shop.e.config.save(cfg)
+    api = shop.setup.api
+    original = api.call
+    quoted_amounts = []
+
+    def call(path, payload=None, params=None, idempotency_key=None):
+        if path == "/catalog" and params["type"] == "steamTopup":
+            assert payload is None
+            return {"catalog": {"currency": "USD", "items": [], "stale": False, "steam_topup": {
+                "available": True, "rates": {"UAH": 41.2}, "price_multiplier": 0.98, "min_usd": 0.15, "max_usd": 1000,
+            }}}
+        if path == "/steamTopup/quote":
+            assert set(payload) == {"amount", "currency"} and payload["currency"] == "UAH"
+            units = int(payload["amount"])
+            quoted_amounts.append(units)
+            # 41.2 UAH/USD and 98% of billed USD. Use integer cents for the supplier fixture.
+            billed_cents = (units * 250 + 102) // 103
+            if (billed_cents < 15 if rounded_minimum else units < 7):
+                raise p.APIError("Below minimum", 422, "AMOUNT_TOO_LOW")
+            charge = Decimal(billed_cents * 98) / 10000
+            if mismatched_quote:
+                charge += Decimal("0.01")
+            return {"quote": {"charge": charge, "currency": "UAH", "amount": units, "rate": 41.2}}
+        return original(path, payload, params, idempotency_key)
+
+    api.call = call
+    return quoted_amounts
+
+
+@pytest.mark.parametrize("rounded_minimum, expected_quotes", [(False, [1, 6, 7]), (True, [1, 6])])
+def test_small_steam_lot_calculates_unit_price_for_every_accepted_quantity(shop, rounded_minimum, expected_quotes):
+    quoted = setup_small_steam_lot(shop, rounded_minimum=rounded_minimum)
+    configure(shop, source="manual", manual_rates={"RUB": "90"}, margin="20", extra_percent="5")
+    preview = shop.e.pricing.calculate("123")
+    assert quoted == expected_quotes
+    assert preview["steam_basis"]["units"] == expected_quotes[-1]
+    assert preview["target"] < 4  # FunPay gets the price of 1 UAH, not the minimum basket in RUB.
+    assert preview["target"] > 2
+    net_rub_per_unit = preview["target"] * Decimal("0.95")
+    for units in range(expected_quotes[-1], 10001):
+        billed_cents = (units * 250 + 102) // 103
+        actual_rub_cost = Decimal(billed_cents * 98) / 10000 * 90
+        assert actual_rub_cost <= net_rub_per_unit * units * Decimal("0.8")
+    assert not shop.setup.api.orders
+
+
+def test_small_steam_lot_auto_writes_and_shows_unit_price_in_telegram(shop):
+    setup_small_steam_lot(shop)
+    configure(shop, enabled=True, source="manual", manual_rates={"RUB": "90"})
+    shop.e.tick()
+    shop.account.save_lot.assert_called_once()
+    price = shop.lot.price
+    panel = shop.e.panel
+    panel.home(panel.context(message()))
+    click(shop.e, "price:123")
+    click(shop.e, "price_calc:123")
+    rendered = shop.e.c.telegram.bot.messages[-1].text
+    assert f"{price:.2f} RUB" in rendered
+    assert "7 UAH" in rendered and "0.1666 USD" in rendered
+    assert not shop.setup.api.orders
+
+
+@pytest.mark.parametrize("failure", ["amount_cap", "charge_cap", "mismatched_quote"])
+def test_small_steam_lot_keeps_price_when_no_usable_quote(shop, failure):
+    setup_small_steam_lot(shop, limit="3" if failure == "amount_cap" else "10000",
+                         mismatched_quote=failure == "mismatched_quote")
+    if failure == "charge_cap":
+        cfg = shop.e.config.snapshot()
+        cfg["lots"]["123"]["max_cost"] = "0.15"
+        shop.e.config.save(cfg)
+    configure(shop, enabled=True, source="manual", manual_rates={"RUB": "90"})
+    shop.e.tick()
+    shop.account.save_lot.assert_not_called()
+    assert not shop.setup.api.orders
+    assert shop.e.pricing.status["123"]
