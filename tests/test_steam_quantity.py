@@ -30,6 +30,68 @@ def test_checkout_amount_is_the_sum_of_all_purchased_units(setup, units):
     assert quote["amount"] == units
 
 
+@pytest.mark.parametrize("use_player", [True, False])
+def test_paid_checkout_login_is_used_without_chat_confirmation(setup, use_player):
+    s = setup
+    cfg = s.e.config.snapshot()
+    cfg["lots"]["123"] = dict(rule("steamTopup"), params={"currency": "UAH", "amount": 1}, max_units=100)
+    s.e.config.save(cfg)
+    s.full.amount = 100
+    s.event.order.description = "Steam, Пополнение, UAH, 100 шт., other_login"
+    if use_player:
+        s.full.player = " 001steam_user "
+    else:
+        s.full.fields = {"custom": NS(name="Логин Steam", value={"ru": "001steam_user", "en": "001steam_user"})}
+    s.e.new_order(s.event)
+    s.e.new_order(s.event)
+
+    quote, purchase = [body for path, body, _ in s.api.calls
+                       if path in {"/steamTopup/quote", "/orders/steamTopup"}]
+    for payload in (quote, purchase):
+        assert (payload["steamLogin"], payload["amount"], payload["currency"]) == ("001steam_user", 100, "UAH")
+    assert len(s.api.orders) == 1 and not s.sent
+    assert s.e.ledger.get("ORDER1")["state"] == "pending"
+
+
+@pytest.mark.parametrize(("player", "field_value"), [(None, None), ("https://steamcommunity.com/id/test", None),
+                                                     ("first_user", "other_user")])
+def test_unusable_checkout_login_falls_back_to_buyer_chat(setup, player, field_value):
+    s = setup
+    cfg = s.e.config.snapshot()
+    cfg["lots"]["123"] = rule("steamTopup")
+    s.e.config.save(cfg)
+    s.full.player = player
+    s.full.fields = {"steam_login": NS(name="Логин Steam", value=field_value)}
+    s.event.order.description = "Steam, Пополнение, UAH, 1 шт., decoy_user"
+    s.e.new_order(s.event)
+
+    row = s.e.ledger.get("ORDER1")
+    assert row["state"] == "collecting" and not row["values"] and not s.api.calls
+    assert "!gameau ORDER1 ЗНАЧЕНИЕ" in s.sent[-1][1]
+
+
+def test_checkout_login_must_still_match_before_purchase(setup, monkeypatch):
+    s = setup
+    cfg = s.e.config.snapshot()
+    cfg["lots"]["123"] = rule("steamTopup")
+    s.e.config.save(cfg)
+    s.full.player = "first_user"
+    original = s.api.call
+
+    def call(path, *args, **kwargs):
+        result = original(path, *args, **kwargs)
+        if path == "/steamTopup/quote":
+            s.full.player = "other_user"
+        return result
+
+    monkeypatch.setattr(s.api, "call", call)
+    s.e.new_order(s.event)
+
+    row = s.e.ledger.get("ORDER1")
+    assert row["state"] == "blocked" and "логин Steam" in row["error"]
+    assert not s.api.orders
+
+
 @pytest.mark.parametrize("refund_enabled", [False, True])
 def test_exceeding_uah_cap_stops_before_collecting_recipient(setup, refund_enabled):
     s = setup
@@ -39,6 +101,7 @@ def test_exceeding_uah_cap_stops_before_collecting_recipient(setup, refund_enabl
                               max_units=p.STEAM_MAX_UNITS, max_topup_amount="10000")
     s.e.config.save(cfg)
     s.full.amount = 10001
+    s.full.player = "steam_user"
     s.c.account.refund = lambda _: setattr(s.full.status, "name", "REFUNDED")
     s.e.new_order(s.event)
     row = s.e.ledger.get("ORDER1")

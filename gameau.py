@@ -23,7 +23,7 @@ from urllib.parse import quote, urlparse
 import requests
 
 NAME = "GameAU"
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 DESCRIPTION = "Автовыдача GameAU: Steam, Telegram, игры, ключи и карты. /gameau"
 CREDITS = "https://github.com/yungspiderq"
 UUID = "7dbcd7e7-2193-43db-a5bb-072eab977041"
@@ -246,6 +246,28 @@ def recipient_value(field, text):
     if field.get("choices") and value not in [str(v) for v in field["choices"]]:
         raise PluginError("Выберите: " + ", ".join(map(str, field["choices"])))
     return value
+
+
+def steam_login_from_order(order):
+    """Read only the checkout field and its structured equivalents."""
+    values = [getattr(order, "player", None)]
+    fields = getattr(order, "fields", None) or {}
+    for key, field in fields.items():
+        name = " ".join(str(getattr(field, "name", "")).casefold().split())
+        if key in {"player", "steam_login", "steamLogin"} or name in {"логин steam", "логін steam", "steam login"}:
+            value = getattr(field, "value", None)
+            values.extend(value.values() if isinstance(value, dict) else [value])
+    logins = set()
+    for value in values:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        if not isinstance(value, str):
+            return None
+        try:
+            logins.add(recipient_value({"path": "steamLogin"}, value))
+        except PluginError:
+            return None
+    return next(iter(logins)) if len(logins) == 1 else None
 
 
 def steam_amount(rule, units):
@@ -933,6 +955,8 @@ class Engine:
                 or o.short_description != row["description"] or o.amount != row["units"]
                 or getattr(o, "order_secrets", None)):
             raise PluginError("Заказ FunPay не оплачен, изменён, возвращён или уже выдан самим FunPay.")
+        if row.get("steam_login_from_order") and steam_login_from_order(o) != row["values"].get("steamLogin"):
+            raise PluginError("Не удалось повторно подтвердить логин Steam из оплаченного заказа.")
         if getattr(self.c, "bl_delivery_enabled", False) and row["buyer_name"] in self.c.blacklist:
             raise PluginError("Покупатель в чёрном списке Cardinal.")
         return o
@@ -1031,23 +1055,27 @@ class Engine:
                    "created": time.time(), "dry_run": cfg["dry_run"], "key_hash": fingerprint(self.api.key()),
                    "idempotency_key": str(uuid.uuid4()),
                    "last_poll": 0, "error": ""}
-            self.verify_order(row)
-            if not self.ledger.add(row):
-                return
+            paid_order = self.verify_order(row)
+            rejection = None
             if units > rule["max_units"]:
-                self.reject(row, OrderRejection("quantity",
-                            f"Куплено {units} шт. Принимается до {rule['max_units']} шт. за заказ."))
-                return
-            if rule["kind"] == "steamTopup":
+                rejection = OrderRejection("quantity",
+                                           f"Куплено {units} шт. Принимается до {rule['max_units']} шт. за заказ.")
+            elif rule["kind"] == "steamTopup":
                 try:
                     steam_amount(rule, units)
                 except OrderRejection as exc:
-                    self.reject(row, exc)
-                    return
-            if rule["inputs"]:
+                    rejection = exc
+                if not rejection and (login := steam_login_from_order(paid_order)):
+                    row.update(state="ready", values={"steamLogin": login}, steam_login_from_order=True)
+            if not rejection and not rule["inputs"]:
+                row["state"] = "ready"
+            if not self.ledger.add(row):
+                return
+            if rejection:
+                self.reject(row, rejection)
+            elif row["state"] == "collecting":
                 self.ask(row)
             else:
-                self.phase(row, "ready")
                 self.process(row)
         except PluginError as exc:
             self.notify(f"#{shortcut.id}: {exc}")
