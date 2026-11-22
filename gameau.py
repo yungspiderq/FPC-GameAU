@@ -23,7 +23,7 @@ from urllib.parse import quote, urlparse
 import requests
 
 NAME = "GameAU"
-VERSION = "1.2.4"
+VERSION = "1.2.5"
 DESCRIPTION = "Автовыдача GameAU: Steam, Telegram, игры, ключи и карты. /gameau"
 CREDITS = "https://github.com/yungspiderq"
 UUID = "7dbcd7e7-2193-43db-a5bb-072eab977041"
@@ -46,7 +46,7 @@ STEAM_MESSAGE_NAMES = {"confirm": "Подтверждение логина", "do
 DEFAULT = {"enabled": False, "dry_run": True, "api_key": "", "live_confirmed": False,
            "min_balance": "0", "lots": {}, "account_id": None,
            "guard_enabled": False, "guard_threshold": "0", "auto_refund": False,
-           "refund_reasons": ["price_limit"], "steam_messages": STEAM_MESSAGE_DEFAULTS}
+           "refund_reasons": ["price_limit"], "steam_messages": STEAM_MESSAGE_DEFAULTS, "steam_confirm_phrase": "Да"}
 REFUND_REASONS = {
     "price_limit": "Цена выше лимита",
     "quantity": "Количество или сумма пополнения вне лимита",
@@ -349,6 +349,10 @@ class Config:
         if (not isinstance(messages, dict) or set(messages) != set(STEAM_MESSAGE_DEFAULTS)
                 or any(not isinstance(text, str) or not text.strip() or len(text) > 1000 for text in messages.values())):
             raise PluginError("Введите текст сообщения длиной от 1 до 1000 символов.")
+        phrase = data.get("steam_confirm_phrase", DEFAULT["steam_confirm_phrase"])
+        if (not isinstance(phrase, str) or not 1 <= len(phrase.strip()) <= 60 or len(phrase.splitlines()) != 1
+                or phrase.lstrip().startswith("!")):
+            raise PluginError("Введите короткий ответ в одну строку, до 60 символов. Например, Да.")
         for lot, rule in data["lots"].items():
             integer(lot, 10**15)
             validate_rule(rule)
@@ -404,8 +408,11 @@ class Ledger:
             result = db.execute("SELECT body FROM orders WHERE id=?", (str(oid),)).fetchone()
         return json.loads(result[0]) if result else None
 
-    def rows(self):
+    def rows(self, state=None):
         with self.connect() as db:
+            if state is not None:
+                return [json.loads(r[0]) for r in db.execute("SELECT body FROM orders WHERE state=? ORDER BY rowid DESC",
+                                                            (state,))]
             return [json.loads(r[0]) for r in db.execute("SELECT body FROM orders ORDER BY rowid DESC")]
 
     def holds(self):
@@ -936,7 +943,7 @@ class Engine:
 
     def tell(self, row, text):
         try:
-            return bool(self.c.send_message(row["chat_id"], text, row["buyer_name"]))
+            return self.c.send_message(row["chat_id"], text, row["buyer_name"])
         except Exception:
             return False
 
@@ -1115,40 +1122,101 @@ class Engine:
             self.tell(row, f"Заказ #{row['id']}. Укажите: {title}.\n"
                       f"Отправьте: !gameau {row['id']} ЗНАЧЕНИЕ\nПароль от аккаунта не нужен.")
         else:
-            self.phase(row, "confirm", nonce=secrets.token_hex(3), confirm_until=time.time() + 900)
-            if row["rule"]["kind"] == "steamTopup":
+            self.phase(row, "confirm", nonce=secrets.token_hex(3), confirm_until=time.time() + 900,
+                       short_reply_after=None)
+            steam = row["rule"]["kind"] == "steamTopup"
+            if steam:
                 question = self.steam_message(row, "confirm")
             else:
                 info = "; ".join(row["values"].values())
                 question = f"Заказ #{row['id']}. Проверьте получателя: {info}."
-            self.tell(row, f"{question}\n"
-                      f"Если всё верно, отправьте: !gameau {row['id']} да {row['nonce']}\n"
-                      f"Чтобы исправить данные, отправьте: !gameau {row['id']} заново")
+            command = f"!gameau {row['id']} да {row['nonce']}"
+            if steam:
+                phrase = self.config.snapshot().get("steam_confirm_phrase", DEFAULT["steam_confirm_phrase"]).strip()
+                question += (f"\nЕсли всё верно, ответьте: {phrase}\n"
+                             f"Если ждут подтверждения несколько заказов, отправьте: {command}")
+            else:
+                question += f"\nЕсли всё верно, отправьте: {command}"
+            sent = self.tell(row, f"{question}\nЧтобы исправить данные, отправьте: !gameau {row['id']} заново")
+            if steam:
+                messages = sent if isinstance(sent, (list, tuple)) else (sent,)
+                ids = [msg.id for msg in messages if type(getattr(msg, "id", None)) is int and msg.id > 0]
+                if ids:
+                    self.phase(row, "confirm", short_reply_after=max(ids), confirm_phrase=" ".join(phrase.casefold().split()))
+
+    def is_buyer_message(self, row, msg):
+        buyer_id = str(row["buyer_id"])
+        if str(getattr(msg, "author_id", None)) != buyer_id:
+            return False
+        chat_id = str(getattr(msg, "chat_id", ""))
+        order_chat = str(row["chat_id"])
+        if chat_id == order_chat:
+            return True
+        # Cardinal reads the interlocutor from the private chat node returned by FunPay.
+        if not chat_id.isdecimal() or str(getattr(msg, "interlocutor_id", None)) != buyer_id:
+            return False
+        pair = sorted((int(buyer_id), int(self.c.account.id)))
+        return order_chat == f"users-{pair[0]}-{pair[1]}"
+
+    def short_confirmation(self, msg, text):
+        phrase = " ".join(text.casefold().split())
+        if not phrase or len(phrase) > 60:
+            return None
+        current = self.config.snapshot().get("steam_confirm_phrase", DEFAULT["steam_confirm_phrase"])
+        candidates = [r for r in self.ledger.rows("confirm") if self.is_buyer_message(r, msg)]
+        matches = [r for r in candidates if r["rule"]["kind"] == "steamTopup"
+                   and phrase == r.get("confirm_phrase", " ".join(current.casefold().split()))]
+        if not matches:
+            return None
+        if len(candidates) != 1:
+            message_id = getattr(msg, "id", None)
+            if type(message_id) is int:
+                for row in matches:
+                    if row.get("short_reply_after") and message_id > row["short_reply_after"]:
+                        row["short_reply_after"] = message_id
+                        self.ledger.put(row)
+            self.tell(matches[0], "В чате несколько заказов ждут подтверждения. Скопируйте команду с номером нужного заказа.")
+            return None
+        return matches[0]
 
     def message(self, msg):
         if not self.active() or getattr(msg, "by_bot", False) or getattr(msg, "badge", None):
             return
-        parts = (getattr(msg, "text", None) or "").strip().split(maxsplit=2)
-        if len(parts) != 3 or parts[0].lower() != "!gameau":
+        text = (getattr(msg, "text", None) or "").strip()
+        parts = text.split(maxsplit=2)
+        short = not parts or parts[0].lower() != "!gameau"
+        if short:
+            row = self.short_confirmation(msg, text)
+            value = ""
+        elif len(parts) == 3:
+            row = self.ledger.get(parts[1].lstrip("#").upper())
+            value = parts[2].strip()
+        else:
             return
-        row = self.ledger.get(parts[1].lstrip("#").upper())
-        if (not row or row["state"] not in {"collecting", "confirm"}
-                or msg.author_id != row["buyer_id"] or str(msg.chat_id) != str(row["chat_id"])):
+        if not row or row["state"] not in {"collecting", "confirm"} or not self.is_buyer_message(row, msg):
             return
         try:
-            value = parts[2].strip()
             restart = value.lower() == "заново"
             self.verify_order(row, check_checkout_login=not restart)
             if restart:
                 self.phase(row, "collecting", values={}, steam_login_from_order=False, buyer_confirmed=False)
                 self.ask(row)
             elif row["state"] == "confirm":
-                if value != "да " + row["nonce"]:
+                if short:
+                    reply_after = row.get("short_reply_after")
+                    if not reply_after:
+                        self.ask(row)
+                        return
+                    if type(getattr(msg, "id", None)) is not int or msg.id <= reply_after:
+                        return
+                elif value.casefold().split() != ["да", row["nonce"]]:
                     raise PluginError("Скопируйте команду подтверждения из последнего сообщения бота.")
                 if time.time() > row["confirm_until"]:
                     self.ask(row)
                     return
                 self.phase(row, "ready", buyer_confirmed=True)
+                if row["rule"]["kind"] == "steamTopup":
+                    self.tell(row, f"Заказ #{row['id']}. Логин Steam подтверждён. Проверяю возможность пополнения.")
                 self.process(row)
             else:
                 field = next(f for f in row["rule"]["inputs"] if f["path"] not in row["values"])
@@ -1683,12 +1751,16 @@ class Panel:
                    [("◀️ К плагину", f"={CBT.EDIT_PLUGIN}:{UUID}:0")]])
 
     def steam_messages(self, ctx, note=""):
-        templates = self.e.config.snapshot().get("steam_messages", STEAM_MESSAGE_DEFAULTS)
+        cfg = self.e.config.snapshot()
+        templates = cfg.get("steam_messages", STEAM_MESSAGE_DEFAULTS)
+        phrase = cfg.get("steam_confirm_phrase", DEFAULT["steam_confirm_phrase"])
         self.show(ctx, f"💬 Сообщения покупателям Steam{note}\n\n"
                   f"Подтверждение логина\n{templates['confirm']}\n\n"
                   f"Заказ выполнен\n{templates['done']}\n\n"
-                  "К запросу подтверждения бот добавляет логин, сумму и команды для ответа.",
+                  f"Короткий ответ: {phrase}\n"
+                  "Он подходит, когда в чате ждёт подтверждения один заказ.",
                   [[("✏️ Подтверждение логина", "steam_msg_edit:confirm")],
+                   [("✏️ Короткий ответ", "steam_reply")],
                    [("✏️ Заказ выполнен", "steam_msg_edit:done")],
                    [("↩️ Вернуть стандартные тексты", "steam_msg_reset")], [("🏠 Меню", "home")]])
 
@@ -1963,6 +2035,11 @@ class Panel:
                 self.e.config.save(cfg)
                 self.pending.pop(self.key(ctx), None)
                 self.steam_messages(ctx, " · сохранено")
+            elif step == "steam_reply":
+                cfg["steam_confirm_phrase"] = text
+                self.e.config.save(cfg)
+                self.pending.pop(self.key(ctx), None)
+                self.steam_messages(ctx, " · сохранено")
             elif step == "key":
                 if len(text) < 8 or len(text) > 1024 or any(c.isspace() for c in text):
                     raise PluginError("Неверный формат API-ключа.")
@@ -2087,6 +2164,9 @@ class Panel:
             self.home(ctx)
         elif name == "steam_messages":
             self.steam_messages(ctx)
+        elif name == "steam_reply":
+            self.begin(ctx, name, "💬 Отправьте новый короткий ответ для подтверждения логина в одну строку.\n"
+                       "Например, Да или Подтверждаю. Регистр букв не важен.")
         elif name == "steam_msg_edit" and arg in STEAM_MESSAGE_NAMES:
             templates = cfg.get("steam_messages", STEAM_MESSAGE_DEFAULTS)
             self.begin(ctx, name, f"✏️ {STEAM_MESSAGE_NAMES[arg]}\n\n"
@@ -2096,6 +2176,7 @@ class Panel:
                        "{currency} — валюта, {quantity} — количество штук.", kind=arg)
         elif name == "steam_msg_reset":
             cfg["steam_messages"] = copy.deepcopy(STEAM_MESSAGE_DEFAULTS)
+            cfg["steam_confirm_phrase"] = DEFAULT["steam_confirm_phrase"]
             self.e.config.save(cfg)
             self.steam_messages(ctx, " · стандартные тексты восстановлены")
         elif name in {"steam_units", "steam_cap"}:
