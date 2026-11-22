@@ -22,7 +22,7 @@ from urllib.parse import quote, urlparse
 import requests
 
 NAME = "GameAU"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DESCRIPTION = "Автовыдача GameAU: Steam, Telegram, игры, ключи и карты. /gameau"
 CREDITS = "https://github.com/yungspiderq"
 UUID = "7dbcd7e7-2193-43db-a5bb-072eab977041"
@@ -39,7 +39,15 @@ NAMES = {"steamLogin": "Логин Steam (не ник)", "invite_url": "Ссыл
          "server_id": "ID сервера"}
 DEFAULT = {"enabled": False, "dry_run": True, "api_key": "", "live_confirmed": False,
            "min_balance": "0", "lots": {}, "account_id": None,
-           "guard_enabled": False, "guard_threshold": "0"}
+           "guard_enabled": False, "guard_threshold": "0", "auto_refund": False,
+           "refund_reasons": ["price_limit"]}
+REFUND_REASONS = {
+    "price_limit": "Цена выше лимита",
+    "quantity": "Количество или сумма пополнения вне лимита",
+    "recipient": "Steam не принимает пополнение получателя",
+    "stock": "Недостаточно товара у GameAU",
+    "balance": "Не хватает баланса GameAU или резерва",
+}
 PRICE_DEFAULT = {"enabled": False, "source": "funpay", "margin": "10", "withdraw_usdt": "100",
                  "usdt_per_usd": "1", "extra_percent": "0", "manual_rates": {}, "manual_lots": []}
 PRICE_INTERVAL = 15 * 60
@@ -59,6 +67,13 @@ class APIError(PluginError):
         super().__init__(message)
         self.status = status
         self.code = code
+
+
+class OrderRejection(PluginError):
+    """A specific, confirmed reason the order cannot be purchased."""
+    def __init__(self, reason, message):
+        super().__init__(message)
+        self.reason = reason
 
 
 def number(value, zero=False):
@@ -242,9 +257,12 @@ class Config:
 
     def save(self, data):
         price_settings(data.get("pricing", {}))
-        for key in ("enabled", "dry_run", "live_confirmed", "guard_enabled"):
+        for key in ("enabled", "dry_run", "live_confirmed", "guard_enabled", "auto_refund"):
             if type(data.get(key)) is not bool:
                 raise PluginError("Неверные переключатели в настройках.")
+        reasons = data.get("refund_reasons")
+        if not isinstance(reasons, list) or any(not isinstance(r, str) or r not in REFUND_REASONS for r in reasons):
+            raise PluginError("Неверные причины автовозврата.")
         number(data.get("min_balance"), zero=True)
         number(data.get("guard_threshold"), zero=True)
         if not isinstance(data.get("api_key"), str) or not isinstance(data.get("lots"), dict):
@@ -272,9 +290,10 @@ class Ledger:
         with self.connect() as db:
             db.execute("CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, state TEXT, body TEXT)")
             db.execute("CREATE TABLE IF NOT EXISTS holds (id TEXT PRIMARY KEY, owned INTEGER NOT NULL)")
+        interrupted = {"creating": "uncertain", "delivering": "delivery_review", "refunding": "refund_review"}
         for row in self.rows():
-            if row["state"] in {"creating", "delivering"}:
-                row["state"] = "uncertain" if row["state"] == "creating" else "delivery_review"
+            if row["state"] in interrupted:
+                row["state"] = interrupted[row["state"]]
                 self.put(row)
 
     @contextmanager
@@ -390,8 +409,8 @@ class API:
             known = {"PRICE_CHANGED", "INSUFFICIENT_BALANCE", "IDEMPOTENCY_CONFLICT", "ORDER_STATUS_UNKNOWN",
                      "PRODUCT_NOT_FOUND", "STEAM_LOGIN_UNAVAILABLE", "AMOUNT_TOO_LOW", "AMOUNT_TOO_HIGH",
                      "MAX_CHARGE_REQUIRED", "IDEMPOTENCY_KEY_REQUIRED", "INVALID_ORDER_DATA", "PRICE_OUTLIER"}
-            code = error.get("code") if isinstance(error, dict) else None
-            code = code if code in known else None
+            code = error.get("code") if isinstance(error, dict) and error.get("ok") is False else None
+            code = code if isinstance(code, str) and code in known else None
             raise APIError(f"GameAU HTTP {r.status_code}" + (f" · {code}" if code else "")
                            + ". Проверьте ключ, баланс и журнал заказов.", r.status_code, code)
         try:
@@ -784,10 +803,10 @@ class Engine:
         self.lot_cache = dict(lots)
         return lots
 
-    def verify_order(self, row):
+    def verify_order(self, row, statuses=("PAID",)):
         self.bind_account()
         o = self.c.account.get_order(row["id"])
-        if (o.id != row["id"] or getattr(o.status, "name", "") != "PAID" or o.seller_id != self.c.account.id
+        if (o.id != row["id"] or getattr(o.status, "name", "") not in statuses or o.seller_id != self.c.account.id
                 or o.buyer_id != row["buyer_id"] or str(o.chat_id) != str(row["chat_id"])
                 or o.short_description != row["description"] or o.amount != row["units"]
                 or getattr(o, "order_secrets", None)):
@@ -824,7 +843,9 @@ class Engine:
             if len(candidates) != 1 or str(candidates[0].id) != lid:
                 raise PluginError("Неоднозначный лот. Используйте уникальные названия в категории/сервере.")
             rule = validate_rule(rule)
-            units = integer(o.amount, rule["max_units"])
+            units = integer(o.amount, 10**15)
+            if units != o.amount:
+                raise PluginError("FunPay не подтвердил количество в заказе.")
             row = {"id": o.id, "state": "collecting", "lot_id": lid, "rule": rule,
                    "units": units, "description": o.short_description, "buyer_id": o.buyer_id,
                    "buyer_name": o.buyer_username, "chat_id": o.chat_id, "values": {},
@@ -833,6 +854,10 @@ class Engine:
                    "last_poll": 0, "error": ""}
             self.verify_order(row)
             if not self.ledger.add(row):
+                return
+            if units > rule["max_units"]:
+                self.reject(row, OrderRejection("quantity",
+                            f"Куплено {units} шт. Принимается до {rule['max_units']} шт. за заказ."))
                 return
             if rule["inputs"]:
                 self.ask(row)
@@ -933,9 +958,21 @@ class Engine:
         kind = rule["kind"]
         payload = make_payload(rule, row["units"], row["values"])
         if kind in {"steamTopup", "steamGifts"}:
-            data = self.api.call("/" + kind + "/quote", payload).get("quote")
+            try:
+                data = self.api.call("/" + kind + "/quote", payload).get("quote")
+            except APIError as exc:
+                if kind == "steamTopup" and exc.status == 422 and exc.code == "STEAM_LOGIN_UNAVAILABLE":
+                    raise OrderRejection("recipient", "GameAU отклонил пополнение этого логина Steam.") from None
+                if kind == "steamTopup" and exc.status == 422 and exc.code in {"AMOUNT_TOO_LOW", "AMOUNT_TOO_HIGH"}:
+                    raise OrderRejection("quantity", "Сумма пополнения вне допустимого диапазона GameAU.") from None
+                raise
             if not isinstance(data, dict) or data.get("charge_currency", "USD") != "USD":
                 raise PluginError("Не удалось проверить расчёт GameAU.")
+            if kind == "steamTopup" and any(key in data and data[key] != payload[key]
+                                            for key in ("steamLogin", "currency", "amount")):
+                raise PluginError("GameAU вернул расчёт для других реквизитов.")
+            if kind == "steamTopup" and data.get("can_refill") is False:
+                raise OrderRejection("recipient", "GameAU отклонил пополнение этого логина Steam.")
             if kind == "steamTopup" and data.get("can_refill") is not True:
                 raise PluginError("GameAU не подтвердил возможность пополнения этого логина Steam.")
             order = data.get("order") or {}
@@ -950,12 +987,12 @@ class Engine:
             total = self.catalog_cost(rule, row["units"])
         maximum = usd(rule["max_cost"])
         if total > maximum:
-            raise PluginError("Стоимость заказа выше установленного лимита USD.")
+            raise OrderRejection("price_limit", f"Закупка {total:f} USD выше лимита {maximum:f} USD.")
         balance = self.account()
         reserve = number(self.config.snapshot()["min_balance"], zero=True)
         available = balance - reserve
         if available < total:
-            raise PluginError("Недостаточно баланса или будет нарушен минимальный остаток.")
+            raise OrderRejection("balance", "Недостаточно баланса или будет нарушен минимальный остаток.")
         # maxCharge is enforced by GameAU. Never send more than the configured ceiling or available balance.
         ceiling = min(maximum, available, total) if kind in {"steamTopup", "steamGifts"} else min(maximum, available)
         ceiling = ceiling.quantize(Decimal("0.0001"), rounding="ROUND_DOWN")
@@ -972,12 +1009,76 @@ class Engine:
         count = rule.get("quantity", 1) * units if kind in {"gamekeys", "giftcards"} else 1
         if kind == "telegramStars":
             count = rule["params"]["quantity"]
-        if count < integer(item.get("min_quantity"), 10000) or count > integer(item.get("max_quantity"), 10000):
-            raise PluginError("Количество не соответствует текущим условиям GameAU.")
+        minimum = integer(item.get("min_quantity"), 10000)
+        maximum = integer(item.get("max_quantity"), 10000)
+        if minimum > maximum:
+            raise PluginError("GameAU вернул неверный диапазон количества.")
+        if not minimum <= count <= maximum:
+            raise OrderRejection("quantity", "Количество не соответствует текущим условиям GameAU.")
         stock = item.get("stock")
-        if stock is not None and (type(stock) is not int or stock < count):
-            raise PluginError("Недостаточно товара у GameAU.")
+        if stock is not None:
+            if type(stock) is not int or stock < 0:
+                raise PluginError("GameAU вернул неверный остаток товара.")
+            if stock < count:
+                raise OrderRejection("stock", "Недостаточно товара у GameAU.")
         return number(item.get("price")) * units
+
+    def refund_allowed(self, row, reason):
+        cfg = self.config.snapshot()
+        binding = cfg["lots"].get(row["lot_id"])
+        return (self.active() and cfg["live_confirmed"] and not cfg["dry_run"] and not row["dry_run"]
+                and cfg["auto_refund"] and reason in cfg["refund_reasons"]
+                and binding and binding.get("enabled", True) and validate_rule(binding) == row["rule"])
+
+    def reject(self, row, rejection, *, price_declined=False):
+        unpurchased = (not row.get("remote_id") and
+                       (price_declined or (row["state"] in {"ready", "collecting"} and "payload" not in row)))
+        if not unpurchased:
+            return
+        self.phase(row, "purchase_rejected" if price_declined else "blocked",
+                   error=str(rejection), refund_reason=rejection.reason)
+        if self.refund_allowed(row, rejection.reason):
+            self.auto_refund(row)
+        else:
+            self.notify(f"#{row['id']}: {rejection}")
+
+    def auto_refund(self, row):
+        if row.get("remote_id") or not (
+                (row["state"] == "blocked" and "payload" not in row) or row["state"] == "purchase_rejected"):
+            return
+        try:
+            self.same_key(row)
+            lot = self.c.account.get_lot_fields(int(row["lot_id"]))
+            if lot.auto_delivery:
+                raise PluginError("У лота включена штатная автовыдача FunPay.")
+            self.verify_order(row)
+            if not self.refund_allowed(row, row["refund_reason"]):
+                raise PluginError("Автовозврат выключен для этой причины.")
+        except Exception as exc:
+            error = str(exc) if isinstance(exc, PluginError) else "Не удалось повторно проверить заказ FunPay."
+            self.notify(f"#{row['id']}: автовозврат не отправлен. {row['error']} {error}")
+            return
+
+        # Persist the request before calling FunPay so a restart cannot resume procurement.
+        self.phase(row, "refunding")
+        try:
+            self.c.account.refund(row["id"])
+        except Exception:
+            # Even a network error may follow an accepted refund. Confirm the order status below.
+            pass
+        self.check_refund(row)
+
+    def check_refund(self, row):
+        if row["state"] not in {"refunding", "refund_review"}:
+            return
+        try:
+            self.verify_order(row, statuses=("REFUNDED",))
+        except Exception:
+            self.phase(row, "refund_review")
+            self.notify(f"#{row['id']}: FunPay пока не подтвердил полный возврат. Сверьте заказ в журнале /gameau.")
+            return
+        self.phase(row, "refunded")
+        self.notify(f"#{row['id']}: FunPay подтвердил возврат. {row['error']}")
 
     def process(self, row):
         if row["state"] != "ready" or not self.active():
@@ -997,8 +1098,12 @@ class Engine:
             self.verify_order(row)
             if not self.active():
                 return
+            first_attempt = "payload" not in row
             self.phase(row, "creating", payload=payload)
-            self.create(row)
+            self.create(row, first_attempt=first_attempt)
+        except OrderRejection as exc:
+            if row["state"] == "ready":
+                self.reject(row, exc)
         except PluginError as exc:
             if row["state"] == "ready":
                 self.phase(row, "blocked", error=str(exc))
@@ -1021,7 +1126,7 @@ class Engine:
                 if key in row["payload"] and value != row["payload"][key]:
                     raise PluginError("GameAU вернул другой товар или параметры покупки.")
 
-    def create(self, row):
+    def create(self, row, first_attempt=False):
         if row["state"] not in {"creating", "uncertain"}:
             return
         try:
@@ -1029,14 +1134,24 @@ class Engine:
             self.verify_order(row)
             if not self.active() or self.config.snapshot()["dry_run"] or row["dry_run"]:
                 raise PluginError("Новые покупки остановлены.")
-            data = self.api.call("/orders/" + row["rule"]["kind"], copy.deepcopy(row["payload"]),
-                                 idempotency_key=row["idempotency_key"])
+            try:
+                data = self.api.call("/orders/" + row["rule"]["kind"], copy.deepcopy(row["payload"]),
+                                     idempotency_key=row["idempotency_key"])
+            except APIError as exc:
+                if (first_attempt and not row.get("remote_id") and exc.status == 409 and exc.code == "PRICE_CHANGED"
+                        and self.refund_allowed(row, "price_limit")):
+                    reason = OrderRejection("price_limit", "GameAU отклонил покупку из-за цены выше лимита списания.")
+                    self.reject(row, reason, price_declined=True)
+                    return
+                raise
             order = data.get("order")
             self.validate_remote(order, row)
             self.phase(row, "pending", remote_id=order["id"], last_poll=0, error="")
             self.poll(row)
         except Exception as exc:
             error = str(exc) if isinstance(exc, PluginError) else "Не удалось разобрать ответ GameAU."
+            if row["state"] in {"refunding", "refund_review", "refunded", "purchase_rejected"}:
+                raise
             if not row.get("remote_id"):
                 self.phase(row, "uncertain", error=error)
                 self.notify(f"#{row['id']}: запрос покупки требует сверки в журнале /gameau. {error}")
@@ -1221,7 +1336,9 @@ STATES = {"collecting": "Ждём данные покупателя", "confirm":
           "pending": "Обрабатывается поставщиком", "completed": "Куплен, ожидает выдачи",
           "delivering": "Отправка сообщения", "delivery_review": "Проверьте выдачу в чате",
           "done": "Выдан", "dry_run": "Тест: покупки не было", "blocked": "Остановлен до покупки",
-          "failed": "Не выполнен поставщиком", "cancelled": "Отменён до покупки"}
+          "failed": "Не выполнен поставщиком", "cancelled": "Отменён до покупки",
+          "purchase_rejected": "GameAU отклонил покупку", "refunding": "Возврат отправляется",
+          "refund_review": "Проверьте возврат FunPay", "refunded": "Возвращён на FunPay"}
 
 
 def rule_summary(rule):
@@ -1297,6 +1414,7 @@ class Panel:
                    [("🧪 Тест / реальные покупки", "mode")], [("🔑 API-ключ", "key"), ("💰 Баланс", "balance")],
                    [("📦 Мои лоты", "lots:0"), ("🛍 Каталог API", "catalog")],
                    [("🧾 Заказы", "orders:0"), ("🛡 Минимальный остаток", "reserve")],
+                   [("↩️ Автовозврат", "refund_settings")],
                    [("📉 Отключение лотов по балансу", "guard")],
                    [("💸 Цены и комиссии", "pricing")],
                    [("❓ Как настроить", "help"), ("🔄 Обновить меню", "home")],
@@ -1336,7 +1454,7 @@ class Panel:
             text += (f"{KINDS[r['kind']]}\n{'✅ Включён' if r.get('enabled', True) else '⛔ Выключен'}\n"
                      f"За 1 штуку лота:\n{rule_summary(r)}\n"
                      f"Максимальное списание за весь заказ: {r['max_cost']} USD\n"
-                     f"Максимум штук лота в заказе: {r['max_units']}\n")
+                     f"Плагин обработает до {r['max_units']} шт. в одном заказе FunPay.\n")
         else:
             text += "Не настроен."
         rows = [[("⚙️ Настроить по шагам", f"setup:{lid}")], [("📝 Настроить JSON", f"json:{lid}")]]
@@ -1617,6 +1735,8 @@ class Panel:
         buttons = []
         if row["state"] == "blocked":
             buttons.append([("🔄 Повторить проверку", f"retry:{oid}")])
+        if row["state"] == "refund_review":
+            buttons.append([("🔄 Сверить возврат на FunPay", f"refund_status:{oid}")])
         if row["state"] == "uncertain":
             buttons.append([("🔎 Восстановить запрос", f"recoverask:{oid}")])
         if row["state"] == "pending":
@@ -1653,6 +1773,30 @@ class Panel:
         key = self.key(ctx)
         if name == "home":
             self.home(ctx)
+        elif name in {"refund_settings", "refund_toggle", "refund_reason"}:
+            if name == "refund_toggle":
+                cfg["auto_refund"] = not cfg["auto_refund"]
+                self.e.config.save(cfg)
+            elif name == "refund_reason" and arg in REFUND_REASONS:
+                if arg in cfg["refund_reasons"]:
+                    cfg["refund_reasons"].remove(arg)
+                else:
+                    cfg["refund_reasons"].append(arg)
+                self.e.config.save(cfg)
+            on = cfg["auto_refund"]
+            rows = [[(f"{'✅' if reason in cfg['refund_reasons'] else '⬜️'} {label}", f"refund_reason:{reason}")]
+                    for reason, label in REFUND_REASONS.items()]
+            self.show(ctx, f"↩️ Автовозврат: {'ВКЛ' if on else 'ВЫКЛ'}\n\n"
+                      "Полный возврат на FunPay для выбранных причин, если закупки в GameAU не было.\n"
+                      "Работает при включённом плагине в реальном режиме.",
+                      [[("Выключить автовозврат" if on else "Включить автовозврат", "refund_toggle")],
+                       *rows, [("🏠 Меню", "home")]])
+        elif name == "refund_status":
+            row = self.e.ledger.get(arg)
+            if not row:
+                raise PluginError("Заказ не найден.")
+            self.e.check_refund(row)
+            self.order(ctx, arg)
         elif name == "pricing":
             self.pricing_menu(ctx)
         elif name == "price_list":
@@ -1897,7 +2041,7 @@ class Panel:
                       "4. Проверьте тестовый режим на заказе. Тест не выполняет выдачу!\n"
                       "5. Включите реальный режим и плагин.\n\n"
                       "При необходимости покупатель получит инструкции !gameau и подтвердит реквизиты. "
-                      "Ключи/карты выдаются после успешного статуса GameAU. Возвраты денег FunPay выполняются вручную.\n"
+                      "Ключи/карты выдаются после успешного статуса GameAU. Условия возврата задаются в меню «Автовозврат».\n"
                       "Не удаляйте orders.db: это защита от повторных покупок.", [[("🏠 Меню", "home")]])
 
 
