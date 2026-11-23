@@ -385,6 +385,32 @@ def test_order_description_can_be_verified_in_another_locale(setup):
     assert s.e.ledger.get("ORDER1")["lot_id"] == "123"
 
 
+@pytest.mark.parametrize("problem", [None, "copied_marker", "wrong_id", "multiple_markers", "native_delivery"])
+def test_description_marker_identifies_own_lot_and_checks_editor(setup, problem):
+    s = setup
+    cfg = s.e.config.snapshot()
+    cfg["lots"]["124"] = cfg["lots"]["123"]
+    s.e.config.save(cfg)
+    s.lots[124] = copy.copy(s.lots[123])
+    s.lots[124].id = 124
+    s.full.full_description = "1 UAH за штуку\r\n[GAMEAU:124]"
+    if problem == "multiple_markers":
+        s.full.full_description += "\r\n[GAMEAU:123]"
+    descriptions = {123: "1 UAH за штуку\n[GAMEAU:123]", 124: "Новый текст\n[GAMEAU:124]"}
+    if problem in {"copied_marker", "wrong_id"}:
+        descriptions[123] = descriptions[124]
+    if problem == "wrong_id":
+        descriptions[124] = "Без метки"
+    s.c.account.get_lot_fields = lambda lid: NS(lot_id=lid, description_ru=descriptions[lid],
+                                                auto_delivery=lid == 124 and problem == "native_delivery")
+    s.e.new_order(s.event)
+    if problem:
+        assert not s.api.calls and s.e.ledger.get("ORDER1") is None
+        assert s.notifications
+    else:
+        assert s.e.ledger.get("ORDER1")["lot_id"] == "124" and len(s.api.orders) == 1
+
+
 def test_buyer_identity_and_confirmation(setup):
     s = setup
     cfg = s.e.config.snapshot()

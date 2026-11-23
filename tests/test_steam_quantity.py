@@ -192,6 +192,37 @@ def test_short_reply_asks_for_order_number_when_two_orders_are_waiting(setup):
     assert s.e.ledger.get("ORDER2")["state"] == "pending" and len(s.api.orders) == 1
 
 
+@pytest.mark.parametrize("old_state", ["legacy", "expired", "CLOSED", "REFUNDED"])
+def test_old_order_does_not_block_short_reply_for_current_steam_order(setup, old_state):
+    s = setup
+    cfg = s.e.config.snapshot()
+    cfg["lots"]["123"] = dict(rule("steamTopup"), params={"currency": "UAH", "amount": 1}, max_units=100)
+    s.e.config.save(cfg)
+    s.full.player = "first_user"
+    s.full.chat_id = "users-5-9"
+    other = NS(**(vars(s.full) | {"id": "ORDER2", "player": "second_user", "amount": 7, "status": NS(name="PAID")}))
+    s.c.account.get_order = {"ORDER1": s.full, "ORDER2": other}.__getitem__
+    s.c.send_message = lambda *args: s.sent.append(args) or [NS(id=120 + len(s.sent))]
+    s.e.new_order(s.event)
+    row = s.e.ledger.get("ORDER1")
+    if old_state == "legacy":
+        row.pop("short_reply_after")
+    elif old_state == "expired":
+        row["confirm_until"] = 0
+    else:
+        s.full.status.name = old_state
+    s.e.ledger.put(row)
+
+    s.event.order.id = "ORDER2"
+    s.e.new_order(s.event)
+    s.e.message(NS(text="Да", chat_id=10, id=128, author_id=5, interlocutor_id=5))
+
+    purchase = next(body for path, body, _ in s.api.calls if path == "/orders/steamTopup")
+    assert (purchase["steamLogin"], purchase["amount"], purchase["currency"]) == ("second_user", 7, "UAH")
+    assert s.e.ledger.get("ORDER1")["state"] == "confirm"
+    assert s.e.ledger.get("ORDER2")["state"] == "pending" and len(s.api.orders) == 1
+
+
 def test_expired_checkout_confirmation_requires_a_fresh_code(setup, monkeypatch):
     s = setup
     cfg = s.e.config.snapshot()

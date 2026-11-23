@@ -23,7 +23,7 @@ from urllib.parse import quote, urlparse
 import requests
 
 NAME = "GameAU"
-VERSION = "1.2.5"
+VERSION = "1.2.6"
 DESCRIPTION = "Автовыдача GameAU: Steam, Telegram, игры, ключи и карты. /gameau"
 CREDITS = "https://github.com/yungspiderq"
 UUID = "7dbcd7e7-2193-43db-a5bb-072eab977041"
@@ -112,6 +112,11 @@ def fingerprint(key):
 def description_keys(*values):
     return {" ".join(unicodedata.normalize("NFC", value).split())
             for value in values if isinstance(value, str) and value.strip()}
+
+
+def description_lot_ids(*values):
+    return {match for value in values if isinstance(value, str)
+            for match in re.findall(r"^[ \t]*\[GAMEAU:([1-9][0-9]{0,14})\][ \t]*\r?$", value, re.I | re.M)}
 
 
 def same_subcategory(left, right):
@@ -992,18 +997,25 @@ class Engine:
         def read_descriptions(field, default):
             read = getattr(order, "get_field_value", None)
             values = [read(field, locale) for locale in ("ru", "en")] if callable(read) else []
-            return description_keys(default, *values)
+            return (default, *values)
 
-        summaries = read_descriptions("summary", order.short_description)
-        details = read_descriptions("desc", getattr(order, "full_description", None))
+        summaries = description_keys(*read_descriptions("summary", order.short_description))
+        detail_values = read_descriptions("desc", getattr(order, "full_description", None))
+        details = description_keys(*detail_values)
+        markers = description_lot_ids(*detail_values)
+        if len(markers) > 1:
+            raise PluginError("В описании заказа несколько разных меток GAMEAU. Сверьте лот вручную.")
+        marker = next(iter(markers), None)
         if not summaries and not details:
             raise PluginError("В оплаченном заказе нет описания лота для сверки.")
         candidates = self.order_lot_candidates(order)
         shortlisted = [lot for lot in candidates if description_keys(lot.description) & summaries]
-        if not shortlisted:
+        if not shortlisted or (marker and all(str(lot.id) != marker for lot in candidates)):
             self.refresh_lots()
             candidates = self.order_lot_candidates(order)
             shortlisted = [lot for lot in candidates if description_keys(lot.description) & summaries]
+        if marker and shortlisted:
+            shortlisted.extend(lot for lot in candidates if str(lot.id) == marker and lot not in shortlisted)
         if len(shortlisted) == 1 and not details and str(shortlisted[0].id) == hint:
             return shortlisted[0], False
 
@@ -1018,17 +1030,29 @@ class Engine:
             titles = description_keys(lot.description, getattr(fields, "title_ru", None), getattr(fields, "title_en", None))
             if summaries and not (titles & summaries):
                 continue
-            descriptions = description_keys(getattr(fields, "description_ru", None), getattr(fields, "description_en", None))
-            if details and not (descriptions & details):
+            values = (getattr(fields, "description_ru", None), getattr(fields, "description_en", None))
+            if marker:
+                lot_markers = description_lot_ids(*values)
+                if marker not in lot_markers:
+                    continue
+                if len(lot_markers) != 1:
+                    raise PluginError(f"В редакторе лота #{lot.id} несколько разных меток GAMEAU.")
+            elif details and not (description_keys(*values) & details):
                 continue
             matches.append((lot, getattr(fields, "auto_delivery", False)))
         if len(matches) == 1:
+            if marker and str(matches[0][0].id) != marker:
+                raise PluginError(f"Метка [GAMEAU:{marker}] относится к другому лоту. Сверьте описание на FunPay.")
             if str(matches[0][0].id) != hint and not details:
                 raise PluginError("Кардинал не подтвердил лот, а в заказе нет подробного описания для сверки.")
             return matches[0]
         if matches:
             ids = ", ".join(f"#{lot.id}" for lot, _ in matches[:5])
+            if marker:
+                raise PluginError(f"Метка [GAMEAU:{marker}] найдена в нескольких лотах: {ids}. Сверьте описания на FunPay.")
             raise PluginError(f"Заказ совпал по описанию с несколькими лотами: {ids}. Проверьте заказ вручную.")
+        if marker:
+            raise PluginError(f"Метка [GAMEAU:{marker}] из заказа не подтверждена в редакторе лота FunPay.")
         raise PluginError("Описание из заказа FunPay не совпало с описанием лота. Проверьте краткое и подробное описание.")
 
     def new_order(self, event):
@@ -1163,21 +1187,39 @@ class Engine:
         if not phrase or len(phrase) > 60:
             return None
         current = self.config.snapshot().get("steam_confirm_phrase", DEFAULT["steam_confirm_phrase"])
-        candidates = [r for r in self.ledger.rows("confirm") if self.is_buyer_message(r, msg)]
-        matches = [r for r in candidates if r["rule"]["kind"] == "steamTopup"
-                   and phrase == r.get("confirm_phrase", " ".join(current.casefold().split()))]
+        default_phrase = " ".join(current.casefold().split())
+        pending = [r for r in self.ledger.rows("confirm")
+                   if r["rule"]["kind"] == "steamTopup" and self.is_buyer_message(r, msg)]
+        if not any(phrase == r.get("confirm_phrase", default_phrase) for r in pending):
+            return None
+        now = time.time()
+        candidates = [r for r in pending if r.get("short_reply_after") and r["confirm_until"] >= now]
+        if not candidates:
+            matches = [r for r in pending if phrase == r.get("confirm_phrase", default_phrase)]
+            return matches[0] if len(matches) == 1 else None
+        if len(candidates) > 1:
+            candidates = [row for row in candidates if self.confirmation_still_pending(row)]
+        message_id = getattr(msg, "id", None)
+        matches = [r for r in candidates if phrase == r.get("confirm_phrase", default_phrase)
+                   and type(message_id) is int and message_id > r["short_reply_after"]]
         if not matches:
             return None
         if len(candidates) != 1:
-            message_id = getattr(msg, "id", None)
-            if type(message_id) is int:
-                for row in matches:
-                    if row.get("short_reply_after") and message_id > row["short_reply_after"]:
-                        row["short_reply_after"] = message_id
-                        self.ledger.put(row)
+            for row in matches:
+                row["short_reply_after"] = message_id
+                self.ledger.put(row)
             self.tell(matches[0], "В чате несколько заказов ждут подтверждения. Скопируйте команду с номером нужного заказа.")
             return None
         return matches[0]
+
+    def confirmation_still_pending(self, row):
+        try:
+            order = self.c.account.get_order(row["id"])
+        except Exception:
+            return True
+        status = getattr(getattr(order, "status", None), "name", None)
+        return (getattr(order, "id", None) != row["id"]
+                or status not in {"CLOSED", "REFUNDED", "PARTIALLY_REFUNDED", "UNPAID"})
 
     def message(self, msg):
         if not self.active() or getattr(msg, "by_bot", False) or getattr(msg, "badge", None):
@@ -1802,6 +1844,7 @@ class Panel:
                      f"{order_limits(r)}")
         else:
             text += "Не настроен."
+        text += f"\n\nДля одинаковых названий добавьте в подробное описание отдельной строкой:\n[GAMEAU:{lid}]"
         rows = [[("⚙️ Настроить по шагам", f"setup:{lid}")], [("📝 Настроить JSON", f"json:{lid}")]]
         if r:
             if r["kind"] == "steamTopup":
